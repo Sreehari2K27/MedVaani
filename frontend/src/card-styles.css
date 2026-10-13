@@ -1,0 +1,29 @@
+.action-card.lavender {
+  background: linear-gradient(135deg, #f1f0ff 0%, #f8f8ff 100%);
+}
+
+.action-card.peach {
+  background: linear-gradient(135deg, #fff3ee 0%, #fffaf8 100%);
+}
+
+.action-card .icon-lavender {
+  background: linear-gradient(135deg, #e3e0ff 0%, #eef0ff 100%);
+}
+
+.action-card .icon-peach {
+  background: linear-gradient(135deg, #ffe3d4 0%, #fff2ec 100%);
+}
+
+.action-card {
+  box-shadow: 0 10px 28px rgba(15, 27, 43, 0.05);
+}
+
+.action-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 14px 34px rgba(99, 102, 241, 0.1);
+}
+
+.action-card:focus-within {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}

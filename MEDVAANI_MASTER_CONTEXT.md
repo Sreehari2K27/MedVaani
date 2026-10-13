@@ -1477,6 +1477,46 @@ Competition demo:
 
 ---
 
+# 47. LLM PROVIDER STRATEGY
+
+MedVaani must use an abstraction layer for language-model functionality. The application must not be tightly coupled to a specific LLM provider.
+
+### Provider priority
+
+- **Primary target:** Gnani Evon v3.3, used once its API becomes available and is actually connected.
+- **Current fallback:** Mistral API may be used for development and testing if required.
+- **Temporary fallback:** a deterministic mock implementation may be used to test the workflow before an LLM is connected.
+
+### Provider switching rules
+
+- Switching from Mistral to Evon must require changing the LLM adapter/configuration rather than redesigning the application.
+- Evon must NOT be represented as being used in the product, UI, documentation, demo or portfolio materials unless the actual Evon API is connected.
+- Do not invent or assume Evon's final API details before Gnani publishes them.
+
+### Responsibility split under this strategy
+
+- The LLM is responsible for language understanding, intent detection, information extraction, and similar language tasks.
+- The MedVaani backend / AE state machine remains responsible for workflow state, required fields, validation, safety rules, escalation logic, and case status.
+
+This section defines implementation strategy only. It does not change the model responsibility split in section 26, the Evon output contract in section 25, or the final architecture in section 41.
+
+---
+
+# 48. PATIENT DATA & STORAGE ARCHITECTURE
+
+- The MedVaani backend/database is the system of record for structured adverse-event cases.
+- Prisma, Timbre, and the selected LLM are processing components and must not be treated as the application's patient database.
+- Raw voice recordings should NOT be retained by default.
+- Patient information should be minimized and should not be unnecessarily included in LLM prompts, application logs, GitHub, or public demos.
+- Public demonstrations must use fictional/demo patient information only.
+- The reviewer dashboard reads structured cases from the MedVaani backend.
+- Human review occurs before any downstream pharmacovigilance/safety processing.
+- MedVaani must NOT be described as directly submitting regulatory reports or as directly integrating with a pharmaceutical company's production pharmacovigilance system, unless such an integration is explicitly implemented and documented.
+
+This section defines data architecture only. It does not change the privacy principle in section 11, the safety architecture in section 14, the reviewer dashboard in section 23, or the human-in-the-loop principle in section 35.
+
+---
+
 # END OF MASTER CONTEXT
 
 This document is the canonical reference for MedVaani. Any future AI-assisted build, UI generation, code generation, prompt creation, documentation, testing or presentation work should preserve this context unless the project owner explicitly changes it.
