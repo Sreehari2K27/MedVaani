@@ -208,6 +208,153 @@ _HINDI_SENTENCES: dict[str, str] = {
     "This prototype cannot continue this report.": (
         "यह प्रोटोटाइप इस रिपोर्ट को जारी नहीं रख सकता।"
     ),
+    # ---- documented AE voice flow wording (kept in sync with
+    # app.workflow.ae_engine._question_for and the step constants in
+    # app.workflow.service.conversational) ----
+    # Step 1 - fixed introduction (spoken once per session).
+    "Thank you for taking the time to speak with us.": (
+        "हमसे बात करने के लिए अपना समय देने के लिए धन्यवाद।"
+    ),
+    "I'm here to help record the event for review.": (
+        "मैं समीक्षा के लिए घटना दर्ज करने में मदद के लिए यहाँ हूँ।"
+    ),
+    "I'll ask you a few questions, and we'll prepare a report for review.": (
+        "मैं आपसे कुछ सवाल पूछूँगा, और हम समीक्षा के लिए एक रिपोर्ट तैयार "
+        "करेंगे।"
+    ),
+    "I'm not a substitute for a healthcare professional, and I can't provide medical advice.": (
+        "मैं किसी स्वास्थ्य पेशेवर का विकल्प नहीं हूँ, और मैं चिकित्सकीय सलाह "
+        "नहीं दे सकता।"
+    ),
+    # Step 2 - invite to describe the event.
+    "Please tell me what happened, in your own words.": (
+        "कृपया बताइए कि क्या हुआ, अपने शब्दों में।"
+    ),
+    "Take your time\u2014I'm listening.": (
+        "आप अपने समय से बताइए\u2014मैं सुन रहा हूँ।"
+    ),
+    # Step 3 - medication question and its one-time empathy line.
+    "Could you tell me the name of the medication involved?": (
+        "क्या आप बता सकते हैं कि इसमें शामिल दवा का नाम क्या है?"
+    ),
+    "I'm sorry to hear that you've experienced this.": (
+        "आपको यह अनुभव हुआ, यह जानकर मुझे खेद है।"
+    ),
+    # Step 4 - medication verification.
+    "Just to make sure I have the right medication, is it Lantus SoloStar?": (
+        "बस यह सुनिश्चित करने के लिए, क्या यह Lantus SoloStar है?"
+    ),
+    # Step 5 - reporter identification.
+    "May I ask whether you're the person who experienced this event, or whether you're reporting it on someone else's behalf?": (
+        "क्या मैं जान सकता हूँ कि क्या आप वही व्यक्ति हैं जिन्हें यह घटना हुई, "
+        "या आप किसी और की ओर से यह बता रहे हैं?"
+    ),
+    # Step 6 - identity and contact questions.
+    "Could you please tell me your full name?": (
+        "क्या आप मुझे अपना पूरा नाम बता सकते हैं?"
+    ),
+    "Could you please share your contact number?": (
+        "क्या आप अपना संपर्क नंबर बता सकते हैं?"
+    ),
+    "Could you please tell me the patient's first and last name, along with their date of birth?": (
+        "क्या आप मुझे रोगी का पहला और अंतिम नाम, साथ ही उनकी जन्मतिथि बता सकते हैं?"
+    ),
+    "Could you please tell me your first and last name, along with your date of birth?": (
+        "क्या आप मुझे अपना पहला और अंतिम नाम, साथ ही आपकी जन्मतिथि बता सकते हैं?"
+    ),
+    "Could you please tell me the patient's date of birth?": (
+        "क्या आप मुझे रोगी की जन्मतिथि बता सकते हैं?"
+    ),
+    "Could you please tell me your date of birth?": (
+        "क्या आप मुझे अपनी जन्मतिथि बता सकते हैं?"
+    ),
+    "Was it the name or the date of birth that was incorrect?": (
+        "क्या नाम गलत था या जन्मतिथि?"
+    ),
+    "Sorry, please tell me the name or the date of birth that was incorrect.": (
+        "क्षमा करें, कृपया बताइए कि नाम या जन्मतिथि में से क्या गलत था।"
+    ),
+    "Just to check - was that another symptom, or a correction to what you described?": (
+        "बस पुष्टि के लिए - क्या यह कोई और लक्षण है, या आपके द्वारा बताई गई बात "
+        "में सुधार है?"
+    ),
+    "Sorry, please tell me a full date of birth.": (
+        "क्षमा करें, कृपया पूरी जन्मतिथि बताइए।"
+    ),
+    # Empty-transcript retry (missing input, never an answer).
+    "Sorry, I couldn't catch that. Could you please repeat it?": (
+        "क्षमा करें, मुझे समझ नहीं आया। क्या आप कृपया दोबारा कह सकते हैं?"
+    ),
+    "I couldn't catch the email address. Could you please repeat it?": (
+        "क्षमा करें, मुझे ईमेल पता समझ नहीं आया। क्या आप कृपया दोबारा बता सकते हैं?"
+    ),
+    "Could you please share the patient's contact number?": (
+        "क्या आप रोगी का संपर्क नंबर बता सकते हैं?"
+    ),
+    "Could you please share the best contact number for you?": (
+        "क्या आप अपने लिए सबसे अच्छा संपर्क नंबर बता सकते हैं?"
+    ),
+    "Could you repeat the contact number, digit by digit?": (
+        "क्या आप संपर्क नंबर अंकों में दोहरा सकते हैं?"
+    ),
+    # Step 7 - consent.
+    "Would it be okay for the appropriate team to contact the patient about this report if any follow-up is needed?": (
+        "अगर आगे कोई जानकारी चाहिए हो, तो क्या उचित टीम इस रिपोर्ट के संबंध "
+        "में रोगी से संपर्क कर सकती है?"
+    ),
+    # Step 8 - conditional email question.
+    "May I have the patient's email address, if available?": (
+        "क्या रोगी का ईमेल पता मिल सकता है, यदि उपलब्ध हो तो?"
+    ),
+    "Please tell me the email address you'd like us to record.": (
+        "कृपया वह ईमेल पता बताइए जो आप हमें दर्ज करवाना चाहते हैं।"
+    ),
+    "Could you please spell out your email address, one letter or number at a time?": (
+        "क्या आप अपना ईमेल पता एक-एक अक्षर या अंक में बता सकते हैं?"
+    ),
+    "You can say 'at the rate' for @ and 'dot' for a period.": (
+        "आप '@' के लिए 'at the rate' और '.' के लिए 'dot' कह सकते हैं।"
+    ),
+    # Step 9 - severity screen.
+    "Would you say that the event was severe or life-threatening?": (
+        "क्या आप कहेंगे कि यह घटना गंभीर या जानलेवा थी?"
+    ),
+    # Step 10A - urgent safety response.
+    "Please seek immediate medical attention now.": (
+        "कृपया अभी तुरंत चिकित्सकीय सहायता लें।"
+    ),
+    "If you've already consented to follow-up contact, we'll arrange to collect any additional information at a more convenient time.": (
+        "अगर आपने आगे संपर्क के लिए सहमति दी है, तो हम अतिरिक्त जानकारी बाद "
+        "में एक सुविधाजनक समय पर एकत्र करवाएँगे।"
+    ),
+    # Step 10B.1 - incident date.
+    "Could you tell me when the event occurred?": (
+        "क्या आप बता सकते हैं कि यह घटना कब हुई?"
+    ),
+    # Step 10B.2 - additional information.
+    "Is there anything else you'd like to share that may help us document the event?": (
+        "क्या ऐसा कुछ और है जो आप साझा करना चाहेंगे, जो इस घटना को दर्ज "
+        "करने में हमारी मदद कर सके?"
+    ),
+    "Of course.": "ज़रूर।",
+    "Please tell me any additional details you'd like included.": (
+        "कृपया वे सभी अतिरिक्त विवरण बताइए जो आप शामिल करवाना चाहते हैं।"
+    ),
+    # Step 12 - closing message (consent sentence only when consent stands).
+    "Thank you for sharing this information with us.": (
+        "हमारे साथ यह जानकारी साझा करने के लिए धन्यवाद।"
+    ),
+    "We've prepared the report for review.": (
+        "हमने समीक्षा के लिए रिपोर्ट तैयार कर ली है।"
+    ),
+    "If you provided consent for follow-up contact, the appropriate team may contact you if needed.": (
+        "अगर आपने आगे संपर्क के लिए सहमति दी है, तो ज़रूरत पड़ने पर उचित टीम "
+        "आपसे संपर्क कर सकती है।"
+    ),
+    # Step 6 read-backs (values are interpolated unchanged).
+    "Is that right?": "क्या यह सही है?",
+    "Have I got that right?": "क्या मैंने सही समझा?",
+    "Have I recorded those correctly?": "क्या मैंने उन्हें सही ढंग से दर्ज किया है?",
 }
 
 # Parameterised templates. Values are interpolated exactly as captured (names,
@@ -216,6 +363,26 @@ _HINDI_PATTERNS: tuple[tuple[Pattern[str], str], ...] = (
     (
         re.compile(r"^I heard (.+)\.$"),
         "मैंने {0} सुना।",
+    ),
+    # Step 6 read-backs: the captured value is interpolated unchanged.
+    (
+        re.compile(r"^I have your name as (.+)\.$"),
+        "मेरे पास आपका नाम {0} है।",
+    ),
+    (
+        re.compile(r"^I have your details as (.+)\.$"),
+        "मैंने आपके विवरण इस तरह दर्ज किए हैं: {0}।",
+    ),
+    (
+        re.compile(
+            r"^Let me read that back to make sure I've recorded it correctly: (.+)\.$"
+        ),
+        "मैंने इसे सही ढंग से दर्ज किया है या नहीं, यह सुनिश्चित करने के लिए "
+        "वापस पढ़कर सुनाता हूँ: {0}।",
+    ),
+    (
+        re.compile(r"^I have the number ending in (.+)\.$"),
+        "नंबर का अंतिम हिस्सा {0} है।",
     ),
     (
         re.compile(r"^Sorry, I didn't catch that - please tell me the correct (.+)\.$"),

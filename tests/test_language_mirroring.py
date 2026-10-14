@@ -25,7 +25,11 @@ from app.language.catalog import DEFAULT_LANGUAGE
 from app.providers.base import LLMResult
 from app.session import SessionStore
 from app.workflow.ae_engine import AEStateEngine
-from app.workflow.service.conversational import ConversationalAEWorkflow
+from app.workflow.service.conversational import (
+    ConversationalAEWorkflow,
+    EVENT_DESCRIPTION_QUESTION,
+    INTRODUCTION_MESSAGE,
+)
 
 HINDI_PRODUCT_QUESTION = "आपको क्या लगता है कि किस दवा या उत्पाद से यह हुआ हो सकता है?"
 
@@ -204,11 +208,17 @@ def test_hindi_conversation_mirrors_language_and_voice():
     client = _client(stt, tts)
 
     first = _post(client, "hindi-1")
-    # UI text stays English, spoken text is Hindi, audio uses the Hindi voice.
-    assert first["response_text"] == "Which medicine or product do you think may have caused this?"
+    # The first reply is the approved opening (Step 1 introduction + the
+    # event-description invitation); UI text stays English while the spoken
+    # text is Hindi and audio uses the Hindi voice.
+    assert first["response_text"].startswith(INTRODUCTION_MESSAGE)
+    assert first["response_text"].endswith(
+        "Please tell me what happened, in your own words."
+    )
+    assert first["next_question"] == ["adverse_event", EVENT_DESCRIPTION_QUESTION]
     assert first["conversation_language"] == "hi-IN"
     assert first["language_translated"] is True
-    assert first["spoken_response_text"] == HINDI_PRODUCT_QUESTION
+    assert first["spoken_response_text"] != first["response_text"]
     assert first["voice"] == "Nalini"
     assert tts.calls[-1]["language"] == "hi-IN"
     assert tts.calls[-1]["voice"] == "Nalini"
@@ -383,7 +393,13 @@ def test_first_turn_hindi_hint_keeps_stt_and_tts_in_hindi():
     first = _post(client, "hindi-clean-1", language="hi-IN")
     assert first["conversation_language"] == "hi-IN"
     assert first["language_translated"] is True
-    assert first["spoken_response_text"] == HINDI_PRODUCT_QUESTION
+    # The first reply is the approved opening (Step 1 introduction + the
+    # event-description invitation), spoken in Hindi with the Hindi voice.
+    assert first["response_text"].startswith(INTRODUCTION_MESSAGE)
+    assert first["response_text"].endswith(
+        "Please tell me what happened, in your own words."
+    )
+    assert first["spoken_response_text"] != first["response_text"]
     assert first["voice"] == "Nalini"
     assert tts.calls[-1]["language"] == "hi-IN"
     assert tts.calls[-1]["voice"] == "Nalini"

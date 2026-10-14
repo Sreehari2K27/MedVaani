@@ -39,11 +39,14 @@ def test_initial_report_is_classified_as_ae_and_asks_for_reporter_role():
     first = harness.run_turn(SCRIPTED_JOURNEY[0])
 
     assert first.intent == "ae_report"
-    assert first.current_state == WorkflowState.EVENT_IDENTIFIED.value
+    # Event and medication are captured; the approved order reports the
+    # furthest satisfied state and asks Step 4 (medication verification)
+    # before reporter identification.
+    assert first.current_state == WorkflowState.PRODUCT_IDENTIFIED.value
     assert first.extracted_information["product"]
     assert first.extracted_information["adverse_event"]
     assert first.next_question is not None
-    assert first.next_question[0] == "reporter_role"
+    assert first.next_question[0] == "product_verification"
     assert first.priority == "normal"
     assert first.human_review_required is False
     assert first.completed is False
@@ -52,14 +55,15 @@ def test_initial_report_is_classified_as_ae_and_asks_for_reporter_role():
 def test_reporter_role_then_patient_identification_captures_identity():
     harness = build_harness("AE-journey-002")
     harness.run_turn(SCRIPTED_JOURNEY[0])
-    second = harness.run_turn(SCRIPTED_JOURNEY[1])
+    harness.run_turn(SCRIPTED_JOURNEY[1])  # Step 4: medication verified
 
+    second = harness.run_turn(SCRIPTED_JOURNEY[2])
     # Reporter role is established before patient-specific questions.
     assert second.extracted_information == {"reporter_role": "self"}
     assert second.next_question is not None
     assert second.next_question[0] == "patient_identifier"
 
-    third = harness.run_turn(SCRIPTED_JOURNEY[2])
+    third = harness.run_turn(SCRIPTED_JOURNEY[3])
     assert third.extracted_information == {
         "patient_identifier": "Demo Patient 001",
         "patient_age": "45",
@@ -68,22 +72,29 @@ def test_reporter_role_then_patient_identification_captures_identity():
     assert harness.engine.case.patient_age == "45"
     assert harness.engine.current_state is WorkflowState.PATIENT_IDENTIFIED
     assert third.next_question is not None
-    assert third.next_question[0] == "consent_to_contact"
+    # The patient contact number is collected before consent (approved order).
+    assert third.next_question[0] == "contact_phone"
 
 
 def test_reporter_and_contact_answers_reach_the_engine():
     harness = build_harness("AE-journey-003")
+    # Up to and including the declined Step 8 email question.
     harness.run_journey(SCRIPTED_JOURNEY[:7])
 
     case = harness.engine.case
     assert case.reporter_role == "self"
     assert case.reporter_name is None
-    assert case.preferred_contact_method == "phone"
     assert case.contact_phone == "9999990000"
     assert case.consent_to_contact is True
-    assert case.onset_date == "It started this morning"
-    assert harness.engine.current_state is WorkflowState.EVENT_TIMING_CAPTURED
-    assert harness.engine.missing_information() == ["seriousness", "outcome"]
+    assert case.contact_email_declined is True
+    # Severity is the next question; the incident date follows it (approved
+    # order: severity assessment before the incident date). The outcome is
+    # no longer an interview question.
+    assert harness.engine.current_state is WorkflowState.CONSENT_CAPTURED
+    assert harness.engine.missing_information() == [
+        "seriousness",
+        "onset_date",
+    ]
 
 
 def test_field_map_forwards_reporter_and_contact_fields_to_the_engine():
@@ -113,15 +124,15 @@ def test_normal_journey_walks_every_workflow_state_to_case_completed():
     records = harness.run_journey(SCRIPTED_JOURNEY)
 
     assert [record.current_state for record in records] == [
-        WorkflowState.EVENT_IDENTIFIED.value,
-        WorkflowState.EVENT_IDENTIFIED.value,
-        WorkflowState.PATIENT_IDENTIFIED.value,
-        WorkflowState.CONSENT_CAPTURED.value,
-        WorkflowState.CONSENT_CAPTURED.value,
-        WorkflowState.CONTACT_CAPTURED.value,
-        WorkflowState.EVENT_TIMING_CAPTURED.value,
-        WorkflowState.SERIOUSNESS_SCREENED.value,
-        WorkflowState.CASE_COMPLETED.value,
+        WorkflowState.PRODUCT_IDENTIFIED.value,  # report: event + medication
+        WorkflowState.PRODUCT_IDENTIFIED.value,  # Step 4 medication verified
+        WorkflowState.PRODUCT_IDENTIFIED.value,  # reporter role (self)
+        WorkflowState.PATIENT_IDENTIFIED.value,  # patient name and age
+        WorkflowState.CONTACT_CAPTURED.value,  # patient contact number
+        WorkflowState.CONSENT_CAPTURED.value,  # consent given
+        WorkflowState.CONSENT_CAPTURED.value,  # optional email declined
+        WorkflowState.SERIOUSNESS_SCREENED.value,  # severity: not severe
+        WorkflowState.CASE_COMPLETED.value,  # incident date completes report
     ]
 
     final = records[-1]
@@ -147,13 +158,15 @@ def test_normal_journey_captures_every_required_report_field():
     assert snapshot["patient"]["age"] == "45"
     assert snapshot["reporter"]["role"] == "self"
     assert snapshot["reporter"]["same_as_patient"] is True
-    assert snapshot["contact"]["preferred_method"] == "phone"
     assert snapshot["contact"]["phone"] == "9999990000"
     assert snapshot["contact"]["consent_to_contact"] is True
+    assert snapshot["contact"]["email_declined"] is True
     assert snapshot["onset_date"] == "It started this morning"
     assert snapshot["seriousness"] == "no"
     assert snapshot["medical_care"] == "no"
-    assert snapshot["outcome"] == "not_recovered"
+    # No outcome was volunteered, so the field stays unset (the outcome is
+    # no longer an interview question).
+    assert snapshot["outcome"] is None
     assert snapshot["next_question"] is None
 
 
@@ -215,7 +228,8 @@ def test_urgent_journey_preserves_information_and_prevents_completion():
     assert snapshot["patient"]["age"] == "45"
     assert snapshot["reporter"]["role"] == "self"
     assert snapshot["contact"]["phone"] == "9999990000"
-    assert snapshot["outcome"] == "not_recovered"
+    # No outcome was volunteered before the urgent interruption.
+    assert snapshot["outcome"] is None
 
 
 def test_every_turn_record_exposes_the_required_reported_fields():

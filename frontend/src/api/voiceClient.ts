@@ -47,7 +47,7 @@ export class VoiceApiError extends Error {
 const FRIENDLY_ERRORS: Record<number, string> = {
   400: "MedVaani couldn't read that recording. Please try again.",
   429: "Too many requests. Please wait a moment and try again.",
-  500: "MedVaani services aren't fully configured. Please try again later.",
+  500: "We're having trouble with the speech service right now. Please try again in a moment.",
   502: "The speech service is unavailable right now. Please try again shortly.",
 };
 

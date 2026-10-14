@@ -37,7 +37,11 @@ def test_name_capture_is_read_back_and_blocks_advancement():
 
     question = engine.begin_confirmation("patient_identifier", "Demo Patient 001")
 
-    assert question == "I heard Demo Patient 001. Is that correct?"
+    # Approved Step 6B.2: the name and the already-captured date/age are read
+    # back together.
+    assert question == (
+        "I have your details as Demo Patient 001, 45. Is that correct?"
+    )
     assert engine.next_field() == ("confirmation", question)
     # Candidate is captured but not committed until confirmed.
     assert engine.case.patient_identifier is None
@@ -64,7 +68,7 @@ def test_yes_confirms_name_commits_it_and_allows_advancement():
     assert engine.current_state is WorkflowState.PATIENT_IDENTIFIED
     assert "patient_identifier" not in engine.missing_information()
     assert engine.next_field() is not None
-    assert engine.next_field()[0] == "consent_to_contact"
+    assert engine.next_field()[0] == "contact_phone"
     assert next_question is not None
 
 
@@ -88,8 +92,12 @@ def test_no_keeps_name_unconfirmed_and_reasks_for_correction():
 
     reasked = engine.respond_to_confirmation("no")
 
-    # The rejection re-asks for the name instead of advancing.
-    assert reasked == "May I have your first and last name?"
+    # The rejection re-asks for the name and the date of birth (combined
+    # Step 6B.1 question) instead of advancing.
+    assert reasked == (
+        "Could you please tell me your first and last name, along with your "
+        "date of birth?"
+    )
     assert engine.next_field() == ("patient_identifier", reasked)
     assert engine.case.patient_identifier is None
     assert engine.case.confirmation_candidate == {}
@@ -114,7 +122,7 @@ def test_correction_after_no_is_read_back_then_confirmed():
     assert engine.case.patient_identifier is None
     assert engine.next_field() == (
         "confirmation",
-        "I heard Jane Doe. Is that correct?",
+        "I have your details as Jane Doe, 45. Is that correct?",
     )
 
     engine.respond_to_confirmation("yes")
@@ -129,7 +137,7 @@ def test_unrecognised_reply_is_treated_as_a_correction():
 
     question = engine.respond_to_confirmation("Jane Doe")
 
-    assert question == "I heard Jane Doe. Is that correct?"
+    assert question == "I have your details as Jane Doe, 45. Is that correct?"
     assert engine.case.pending_confirmation == "patient_identifier"
     assert engine.case.confirmation_candidate == {
         "patient_identifier": "Jane Doe"
@@ -172,7 +180,7 @@ def test_plain_name_update_without_confirmation_still_commits():
     assert engine.case.patient_identifier == "Demo Patient 001"
     assert engine.case.pending_confirmation is None
     assert engine.current_state is WorkflowState.PATIENT_IDENTIFIED
-    assert engine.next_field()[0] == "consent_to_contact"
+    assert engine.next_field()[0] == "contact_phone"
 
 
 def test_pending_confirmation_blocks_completion_error():
@@ -205,9 +213,10 @@ def test_devanagari_name_correction_is_recognized_and_read_back():
 
     result = wf.process_turn("जया बच्चन")
 
-    # The correction replaces the stale candidate and is read back; it is
-    # not committed until the reporter confirms it.
-    assert "I heard जया बच्चन" in result.response_text
+    # The correction replaces the stale candidate and is read back with the
+    # already-captured age (approved Step 6B.2); it is not committed until
+    # the reporter confirms it.
+    assert "I have your details as जया बच्चन, 45." in result.response_text
     assert "कर्मा तेल" not in result.response_text
     assert engine.case.confirmation_candidate == {"patient_identifier": "जया बच्चन"}
     assert engine.case.patient_identifier is None
@@ -221,17 +230,20 @@ def test_full_hindi_name_sentence_is_stripped_to_the_name():
 
     # The conversational wrapper is stripped; only the name is read back.
     assert engine.case.confirmation_candidate == {"patient_identifier": "जया बच्चन"}
-    assert "I heard जया बच्चन" in result.response_text
+    assert "I have your details as जया बच्चन, 45." in result.response_text
 
 
 def test_reject_with_nahi_then_devanagari_name_commits_and_advances():
     engine, wf = _workflow_with_stale_candidate()
 
     rejected = wf.process_turn("नहीं")
-    assert engine.case.confirmation_candidate == {}
-    assert engine.case.confirmation_response == "no"
+    # Only the incorrect detail is asked for: the existing candidate is held
+    # until a corrected name or date replaces it.
+    assert engine.case.confirmation_candidate == {
+        "patient_identifier": "कर्मा तेल"
+    }
     assert engine.case.patient_identifier is None
-    assert rejected.response_text  # re-asks for the corrected name
+    assert rejected.response_text  # asks which detail was incorrect
 
     corrected = wf.process_turn("जया बच्चन")
     assert engine.case.confirmation_candidate == {"patient_identifier": "जया बच्चन"}
@@ -240,7 +252,7 @@ def test_reject_with_nahi_then_devanagari_name_commits_and_advances():
     assert engine.case.patient_identifier == "जया बच्चन"
     assert engine.case.pending_confirmation is None
     # The interview advances to the next required field.
-    assert engine.next_field()[0] == "consent_to_contact"
+    assert engine.next_field()[0] == "contact_phone"
     assert committed.response_text
 
 
@@ -254,7 +266,7 @@ def test_latin_name_correction_still_works_through_the_workflow():
 
     wf.process_turn("yes")
     assert engine.case.patient_identifier == "Jaya Bachchan"
-    assert engine.next_field()[0] == "consent_to_contact"
+    assert engine.next_field()[0] == "contact_phone"
 
 
 def test_looks_like_value_script_precision():
@@ -275,10 +287,11 @@ def test_clear_rejection_does_not_increment_failed_attempts():
 
         wf.process_turn(reply)
 
-        # The rejection correctly discards the candidate and re-asks; it is
-        # a successful interpretation, not a failed attempt.
-        assert engine.case.confirmation_candidate == {}
-        assert engine.case.confirmation_response == "no"
+        # The rejection only asks which detail was incorrect: the existing
+        # candidate is held (not discarded) and no failed attempt counts.
+        assert engine.case.confirmation_candidate == {
+            "patient_identifier": "कर्मा तेल"
+        }
         assert wf._confirmation_attempts.get("patient_identifier", 0) == 0
         assert engine.current_state is not WorkflowState.HUMAN_REVIEW
 
@@ -295,7 +308,7 @@ def test_rejection_then_devanagari_name_completes_without_human_review():
     assert engine.current_state is not WorkflowState.HUMAN_REVIEW
     assert committed.human_review_required is False
     assert "reviewed by a member of our team" not in committed.response_text
-    assert engine.next_field()[0] == "consent_to_contact"
+    assert engine.next_field()[0] == "contact_phone"
 
 
 def test_repeated_ambiguous_responses_still_park_for_review_at_the_limit():

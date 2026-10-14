@@ -86,6 +86,45 @@ _MONTH_DAY_YEAR = re.compile(
 )
 _SLASH_DATE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
 
+# ---- spoken-out dates ("fourteenth of May twenty twenty six") --------------
+# Filler words removed before matching a spoken date.
+_SPOKEN_FILLER = re.compile(r"\b(?:the|of|on)\b", re.IGNORECASE)
+# Ordinal suffixes on a numeric day ("14th" -> "14").
+_ORDINAL_SUFFIX = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)\b", re.IGNORECASE)
+
+_DAY_WORDS: dict[str, int] = {
+    "one": 1, "first": 1,
+    "two": 2, "second": 2,
+    "three": 3, "third": 3,
+    "four": 4, "fourth": 4,
+    "five": 5, "fifth": 5,
+    "six": 6, "sixth": 6,
+    "seven": 7, "seventh": 7,
+    "eight": 8, "eighth": 8,
+    "nine": 9, "ninth": 9,
+    "ten": 10, "tenth": 10,
+    "eleven": 11, "eleventh": 11,
+    "twelve": 12, "twelfth": 12,
+    "thirteen": 13, "thirteenth": 13,
+    "fourteen": 14, "fourteenth": 14,
+    "fifteen": 15, "fifteenth": 15,
+    "sixteen": 16, "sixteenth": 16,
+    "seventeen": 17, "seventeenth": 17,
+    "eighteen": 18, "eighteenth": 18,
+    "nineteen": 19, "nineteenth": 19,
+    "twenty": 20, "twentieth": 20,
+    "thirty": 30, "thirtieth": 30,
+}
+
+_YEAR_ONES: dict[str, int] = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9,
+}
+_YEAR_TENS: dict[str, int] = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+
 _DAYS_AGO = re.compile(
     # "two days ago" / "2 days back" - "back" is a common spoken variant.
     r"\b(\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\s+(?:ago|back)\b",
@@ -278,7 +317,87 @@ def _parse_explicit_date(text: str) -> date | None:
         # Both components could be a month: ambiguous, do not guess.
         return None
 
+    # Spoken-out dates ("fourteenth of May twenty twenty six"). Only a full
+    # day + month + year is accepted; partial wording stays unresolved.
+    return _parse_spoken_date(text)
+
+
+def _word_day(text: str) -> int | None:
+    """A spoken day ("fourteen", "fourteenth", "twenty seventh", "27")."""
+    tokens = text.split()
+    if not tokens:
+        return None
+    if len(tokens) == 1:
+        token = tokens[0]
+        if token.isdigit():
+            return int(token) if 1 <= int(token) <= 31 else None
+        return _DAY_WORDS.get(token)
+    if len(tokens) == 2:
+        tens = _DAY_WORDS.get(tokens[0])
+        ones = _DAY_WORDS.get(tokens[1])
+        if tens is not None and ones is not None and tens in (20, 30) and 1 <= ones <= 9:
+            return tens + ones
     return None
+
+
+def _word_year(text: str) -> int | None:
+    """A spoken year ("two thousand", "twenty twenty six", "nineteen ninety eight")."""
+    tokens = [t for t in re.sub(r"\band\b", " ", text.lower()).split() if t]
+    if not tokens:
+        return None
+    if len(tokens) == 1 and tokens[0].isdigit():
+        return int(tokens[0]) if len(tokens[0]) == 4 else None
+
+    def _tail(rest: list[str]) -> int | None:
+        if not rest:
+            return 0
+        if len(rest) != 1:
+            return None
+        token = rest[0]
+        if token.isdigit() and len(token) <= 2:
+            return int(token)
+        return _YEAR_ONES.get(token)
+
+    if tokens[0] == "two" and len(tokens) >= 2 and tokens[1] == "thousand":
+        add = _tail(tokens[2:])
+        year = None if add is None else 2000 + add
+    elif (
+        tokens[0] in ("nineteen", "twenty")
+        and len(tokens) >= 2
+        and tokens[1] in _YEAR_TENS
+    ):
+        add = _tail(tokens[2:])
+        if add is None:
+            return None
+        year = (1900 if tokens[0] == "nineteen" else 2000) + _YEAR_TENS[tokens[1]] + add
+    else:
+        return None
+    if year is None:
+        return None
+    return year if 1900 <= year <= date.today().year else None
+
+
+_MONTH_ANCHOR = re.compile(
+    r"\b(" + "|".join(re.escape(name) for name in sorted(_MONTHS, key=len, reverse=True)) + r")\.?\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_spoken_date(text: str) -> date | None:
+    """A full spoken date ("the 14th of May 2026"), or None when incomplete."""
+    cleaned = _ORDINAL_SUFFIX.sub(r"\1", _SPOKEN_FILLER.sub(" ", text.lower()))
+    anchor = _MONTH_ANCHOR.search(cleaned)
+    if anchor is None:
+        return None
+    before = cleaned[: anchor.start()].strip(" .,;:-")
+    after = cleaned[anchor.end() :].strip(" .,;:-")
+    day = _word_day(before)
+    if day is None or not 1 <= day <= 31:
+        return None
+    year = _word_year(after)
+    if year is None:
+        return None
+    return _safe_date(year, _MONTHS[anchor.group(1).lower()], day)
 
 
 def _safe_date(year: int, month: int, day: int) -> date | None:

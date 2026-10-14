@@ -8,6 +8,7 @@ import wave
 
 from fastapi.testclient import TestClient
 
+from app.config import get_gnani_api_key
 from app.services.prisma import PrismaAPIError, PrismaNetworkError
 
 
@@ -124,15 +125,30 @@ def test_stt_rate_limit_maps_to_429_with_clear_hint():
     assert "Rate limit" in resp.json()["detail"]
 
 
-def test_stt_empty_transcript_stays_502_with_visible_detail():
+def test_stt_empty_transcript_returns_a_retry_without_changing_state():
+    # An empty transcript is missing input, never an answer: the endpoint
+    # returns a short retry message and leaves the session untouched
+    # (supersedes the earlier 502 behaviour).
     resp = _post_voice(
         FailingSTT(
             PrismaAPIError("Gnani STT returned an empty transcript.", status_code=200)
         )
     )
 
-    assert resp.status_code == 502
-    assert "empty transcript" in resp.json()["detail"]
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["reason"] == "empty_transcript"
+    assert body["transcript"] == ""
+    assert "couldn't catch" in body["response_text"]
+    assert body["completed"] is False
+    assert body["safety_status"] == "ok"
+    # The session identity and current state are preserved.
+    assert body["case_id"]
+    assert body["current_state"] == "CASE_CREATED"
+    assert body["next_question"][0] == "adverse_event"
+    # No secret is echoed back to the caller.
+    key = get_gnani_api_key()
+    assert not key or key not in body["response_text"]
 
 
 def test_stt_network_failure_stays_502_with_visible_detail():

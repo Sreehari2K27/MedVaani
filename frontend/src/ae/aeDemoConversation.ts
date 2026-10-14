@@ -6,7 +6,6 @@ export type AeStageId =
   | "consent"
   | "event-timing"
   | "seriousness"
-  | "outcome"
   | "review";
 
 export type AeStageState = "done" | "active" | "todo";
@@ -24,7 +23,6 @@ export const AE_STAGES: AeStage[] = [
   { id: "contact-information", label: "Contact information" },
   { id: "event-timing", label: "Event timing" },
   { id: "seriousness", label: "Seriousness" },
-  { id: "outcome", label: "Outcome" },
   { id: "review", label: "Review" },
 ];
 
@@ -98,16 +96,15 @@ export const AE_STEPS: AeStep[] = [
     question:
       "Have you spoken to a doctor or received medical care for it?",
   },
-  {
-    id: "outcome",
-    stage: "outcome",
-    question:
-      "How are you feeling now - have your symptoms improved, stayed the same, or gotten worse?",
-  },
+  // The outcome is no longer an interview question: once the applicable
+  // information is collected the report is prepared and the conversation
+  // ends with the existing closing message.
 ];
 
+// The fixed opening (Step 1 introduction + Step 2 invitation): shown once
+// per session, and never repeated after the person has described the event.
 export const OPENING_MESSAGE =
-  "I'm here to help you report a side effect. Tell me what happened in your own words.";
+  "Thank you for taking the time to speak with us. I'm here to help record the event for review. I'm not a substitute for a healthcare professional, and I can't provide medical advice. Please tell me what happened, in your own words.";
 
 export const DEMO_EVENT_INPUT =
   "I took Lantus yesterday and since this morning I have a severe headache and vomiting.";
@@ -328,7 +325,9 @@ const buildSummary = (state: AeConversationState): AeSummaryRow[] => {
     { label: "Reporter", value: self ? "Patient" : "Reporter" },
     {
       label: "Consent",
-      value: consentYes ? "Yes" : noConsent ? "No" : "Yes",
+      // Only an explicit answer is shown: an unanswered consent question is
+      // reported as not provided and never silently converted to Yes or No.
+      value: consentYes ? "Yes" : noConsent ? "No" : "Not provided",
     },
     { label: "Status", value: "Ready for human review (demo information)" },
   ];

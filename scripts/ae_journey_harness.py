@@ -42,41 +42,45 @@ INITIAL_REPORT = (
     "I took Lantus yesterday and today I have severe headache and vomiting. "
     "I want to report this adverse event."
 )
+ANSWER_MEDICATION_VERIFICATION = "yes"  # Step 4: the recorded medication stands
 ANSWER_PATIENT_IDENTIFICATION = "Demo Patient 001, 45 years old"
 ANSWER_REPORTER_ROLE = "I am the patient"
-ANSWER_CONTACT_METHOD = "You can reach me by phone"
 ANSWER_CONTACT_PHONE = "9999990000"
-ANSWER_CONTACT_EMAIL = "demo.patient@example.com"
+ANSWER_EMAIL_DECLINE = "no"  # Step 8: the optional email address is declined
 ANSWER_CONSENT = "Yes, I consent"
 ANSWER_ONSET = "It started this morning"
 ANSWER_SERIOUSNESS = (
     "I did not go to the hospital and I am not experiencing a life-threatening reaction"
 )
-ANSWER_OUTCOME = "The headache and vomiting are still ongoing"
 URGENT_STATEMENT = "I am having severe difficulty breathing"
 
 # Normal journey: every required field supplied, so the production workflow
-# reaches CASE_COMPLETED. Consent is captured before any contact detail.
+# reaches CASE_COMPLETED. The approved order is followed: report -> Step 4
+# medication verification -> reporter identification -> patient details ->
+# patient contact number -> consent -> (optional email declined) -> severity
+# -> incident date. The outcome is no longer an interview question, so the
+# report is generated as soon as the applicable information is collected.
 SCRIPTED_JOURNEY = [
     INITIAL_REPORT,
+    ANSWER_MEDICATION_VERIFICATION,
     ANSWER_REPORTER_ROLE,
     ANSWER_PATIENT_IDENTIFICATION,
-    ANSWER_CONSENT,
-    ANSWER_CONTACT_METHOD,
     ANSWER_CONTACT_PHONE,
-    ANSWER_ONSET,
+    ANSWER_CONSENT,
+    ANSWER_EMAIL_DECLINE,
     ANSWER_SERIOUSNESS,
-    ANSWER_OUTCOME,
+    ANSWER_ONSET,
 ]
 
-# Urgent journey: a genuinely urgent statement arriving mid-interview.
+# Urgent journey: a genuinely urgent statement arriving mid-interview, after
+# the patient details and contact number have been collected.
 URGENT_JOURNEY = [
     INITIAL_REPORT,
+    ANSWER_MEDICATION_VERIFICATION,
     ANSWER_REPORTER_ROLE,
     ANSWER_PATIENT_IDENTIFICATION,
     ANSWER_CONTACT_PHONE,
     URGENT_STATEMENT,
-    ANSWER_OUTCOME,
 ]
 
 
@@ -101,7 +105,14 @@ class ScriptedAnswerLLMProvider:
 
         fields = _parse_answer(message)
         if not fields and self.engine is not None:
-            pending = self.engine.next_field()
+            # Prefer the question the conversation is actually asking (the
+            # context carries it, including the documented conversational
+            # steps); the engine's next missing field is only the fallback.
+            pending = None
+            if context and context.get("next_field"):
+                pending = tuple(context["next_field"])
+            if pending is None:
+                pending = self.engine.next_field()
             if pending:
                 fields = _parse_for_pending_field(pending[0], message)
 

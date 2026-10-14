@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import lantusPen from "../../assets/lantus-solostar.png.png";
 import {
   AE_STAGES,
-  FINAL_MESSAGE,
   OPENING_MESSAGE,
   createConversation,
   handleUserInput,
@@ -259,6 +258,19 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
         text: result.transcript.trim() || "(No speech detected)",
       });
 
+      // Step 11: the report is displayed with the existing report-summary
+      // mechanism, immediately before the assistant's closing turn, for both
+      // completion branches (case completed and urgent/human review).
+      const reportReady = (result.completed || result.human_review_required);
+      if (reportReady && !liveFinished) {
+        setLiveFinished(true);
+        pushLive({
+          role: "summary",
+          text: "Report summary",
+          summary: buildLiveSummary(result.ae?.collected_information),
+        });
+      }
+
       if (result.safety_status === "urgent_life_threatening") {
         pushLive({
           role: "safety",
@@ -271,16 +283,6 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
         pushLive({ role: "notice", text: result.response_text });
       } else {
         pushLive({ role: "assistant", text: result.response_text });
-      }
-
-      if (result.completed && !liveFinished) {
-        setLiveFinished(true);
-        pushLive({
-          role: "summary",
-          text: "Report summary",
-          summary: buildLiveSummary(result.ae?.collected_information),
-        });
-        pushLive({ role: "assistant", text: FINAL_MESSAGE });
       }
 
       if (result.audio_path) {

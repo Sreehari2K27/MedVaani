@@ -172,7 +172,9 @@ def test_workflow_advances_on_colloquial_self_reporter_answer():
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
 
     first = workflow.process_turn(INITIAL_REPORT)
-    assert first.next_question[0] == "reporter_role"
+    # The documented Step 4 medication verification precedes Step 5.
+    assert first.next_question[0] == "product_verification"
+    workflow.process_turn("yes")
 
     second = workflow.process_turn("Yes, it's me")
     assert engine.case.reporter_role == "self"
@@ -186,6 +188,7 @@ def test_workflow_advances_on_my_own_experience_answer():
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
 
     workflow.process_turn(INITIAL_REPORT)
+    workflow.process_turn("yes")  # Step 4: medication verified
     second = workflow.process_turn("My own experience")
 
     assert engine.case.reporter_role == "self"
@@ -202,13 +205,17 @@ def test_workflow_captures_age_and_role_keeping_identifier_gating():
 
     first = workflow.process_turn(INITIAL_REPORT)
     assert first.intent == "ae_report"
-    assert engine.current_state is WorkflowState.EVENT_IDENTIFIED
+    # Event and medication are both captured; the approved order reports the
+    # furthest satisfied state (EVENT_IDENTIFIED, then PRODUCT_IDENTIFIED).
+    assert engine.current_state is WorkflowState.PRODUCT_IDENTIFIED
+    workflow.process_turn("yes")  # Step 4: medication verified
 
     second = workflow.process_turn(EXACT_TRANSCRIPT)
 
     assert engine.case.reporter_role == "self"
     assert engine.case.patient_age == "34"
-    assert engine.current_state is WorkflowState.EVENT_IDENTIFIED
+    # Reporter identity for a self-reporter stays gated on patient_identifier.
+    assert engine.current_state is WorkflowState.PRODUCT_IDENTIFIED
     assert second.next_question is not None
     assert second.next_question[0] == "patient_identifier"
     assert second.intent == "unknown"
@@ -221,7 +228,10 @@ def test_self_role_alone_does_not_reach_reporter_identified():
     engine.update("patient_age", "34")
     engine.update("reporter_role", "self")
 
-    assert engine.current_state is WorkflowState.EVENT_IDENTIFIED
+    # Product and event are captured; the approved order advances past
+    # EVENT_IDENTIFIED to PRODUCT_IDENTIFIED, and a self-reporter is not
+    # fully identified until the patient identifier is captured.
+    assert engine.current_state is WorkflowState.PRODUCT_IDENTIFIED
     assert engine.next_field() is not None
     assert engine.next_field()[0] == "patient_identifier"
 
@@ -269,7 +279,7 @@ def _post(client, session_id, tmp):
 
 
 def test_multi_turn_endpoint_captures_age_and_role():
-    stt = FakeSTT([INITIAL_REPORT, EXACT_TRANSCRIPT])
+    stt = FakeSTT([INITIAL_REPORT, "yes", EXACT_TRANSCRIPT])
     tts = FakeTTS()
     session_store = SessionStore()
     app = FastAPI()
@@ -282,6 +292,7 @@ def test_multi_turn_endpoint_captures_age_and_role():
 
     with tempfile.TemporaryDirectory() as tmp:
         first = _post(client, "ae-demo-001", tmp)
+        _post(client, "ae-demo-001", tmp)  # Step 4: medication verified
         second = _post(client, "ae-demo-001", tmp)
 
     assert first.status_code == 200
@@ -291,7 +302,7 @@ def test_multi_turn_endpoint_captures_age_and_role():
     body = second.json()
     assert body["workflow"] == "ae"
     assert body["intent"] == "unknown"
-    assert body["current_state"] == WorkflowState.EVENT_IDENTIFIED.value
+    assert body["current_state"] == WorkflowState.PRODUCT_IDENTIFIED.value
     assert body["completed"] is False
     assert body["next_question"][0] == "patient_identifier"
     assert body["ae"]["extracted_information"]["reporter_role"] == "self"
@@ -315,31 +326,40 @@ def test_real_entry_exact_reproduction_ae_demo_001():
 
     Runs through app.main.create_app (the factory behind ``uvicorn
     app.main:app``) with the real Prisma-style lowercase transcripts and
-    session id AE-DEMO-001, and asserts Audio 2 is applied by the endpoint:
-    patient_age=34, reporter_role=self, state stays EVENT_IDENTIFIED and the
-    next question stays patient_identifier (identifier gating intact).
+    session id AE-DEMO-001. Audio 2 is answered after the documented Step 4
+    medication verification, and asserts the endpoint applies it:
+    patient_age=34, reporter_role=self, and the next question stays
+    patient_identifier (identifier gating intact).
     """
     from app.main import create_app
 
-    stt = FakeSTT([REAL_AUDIO_1, REAL_AUDIO_2])
+    stt = FakeSTT([REAL_AUDIO_1, "yes", REAL_AUDIO_2])
     app = create_app(prisma=stt, timbre=FakeTTS())
     client = TestClient(app)
 
     with tempfile.TemporaryDirectory() as tmp:
         first = _post(client, REAL_SESSION_ID, tmp)
+        verified = _post(client, REAL_SESSION_ID, tmp)
         second = _post(client, REAL_SESSION_ID, tmp)
 
     assert first.status_code == 200
+    assert verified.status_code == 200
     assert second.status_code == 200
-    one, two = first.json(), second.json()
+    one, checked, two = first.json(), verified.json(), second.json()
 
-    # Audio 1: report identified, case open, reporter-role question asked.
+    # Audio 1: report identified, case open, medication verification asked
+    # (the documented Step 4 precedes reporter identification).
     assert one["workflow"] == "ae"
     assert one["intent"] == "ae_report"
-    assert one["current_state"] == WorkflowState.EVENT_IDENTIFIED.value
-    assert one["next_question"][0] == "reporter_role"
+    assert one["current_state"] == WorkflowState.PRODUCT_IDENTIFIED.value
+    assert one["next_question"][0] == "product_verification"
 
-    # Session and case continuity across the two audios.
+    # Step 4 confirmed: the recorded medication stands and reporter
+    # identification (Step 5) is next.
+    assert checked["ae"]["collected_information"]["product"] == "Lantus SoloStar"
+    assert checked["next_question"][0] == "reporter_role"
+
+    # Session and case continuity across the audios.
     assert two["session_id"] == REAL_SESSION_ID
     assert two["case_id"] == one["case_id"]
 
@@ -358,7 +378,7 @@ def test_real_entry_exact_reproduction_ae_demo_001():
     assert "reporter_role" not in two["missing_information"]
 
     # No false progression: patient_identifier is still required.
-    assert two["current_state"] == WorkflowState.EVENT_IDENTIFIED.value
+    assert two["current_state"] == WorkflowState.PRODUCT_IDENTIFIED.value
     assert two["next_question"][0] == "patient_identifier"
     assert "patient_identifier" in two["missing_information"]
     assert two["completed"] is False
@@ -484,7 +504,9 @@ def test_hindi_spoken_phone_completes_contact_capture():
 
     assert engine.case.contact_phone == "92244111"
     assert result.next_question is not None
-    assert result.next_question[0] == "onset_date"
+    # Consent was already captured; the approved order asks severity next
+    # (severity assessment before the incident date).
+    assert result.next_question[0] == "seriousness"
 
 
 def test_unclarifiable_phone_parks_report_for_human_review():
@@ -532,6 +554,7 @@ def test_workflow_preserves_original_description_and_deduplicates_additions():
     workflow.process_turn(INITIAL_REPORT)
     original = engine.case.adverse_event
     assert original == INITIAL_REPORT
+    workflow.process_turn("yes")  # Step 4: medication verified
 
     # A symptom already contained in the original sentence is not duplicated.
     workflow.process_turn("severe headache")
@@ -565,6 +588,7 @@ def _workflow_with_medical_care_yes(case_id: str):
     engine = AEStateEngine.create_case(case_id)
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
     workflow.process_turn(INITIAL_REPORT)
+    workflow.process_turn("yes")  # Step 4: medication verified
     engine.update("medical_care", "yes")  # hospitalization already reported
     return engine, workflow
 
@@ -691,14 +715,14 @@ def _pending_age_fields(text: str) -> dict:
 @pytest.mark.parametrize(
     "text,expected",
     [
-        ("I was born on 12 March 1980", "12 March 1980"),
-        ("my date of birth is 05/01/1980", "05/01/1980"),
-        ("1980-03-12", "1980-03-12"),
-        ("I was born in 1980", "born in 1980"),
-        ("my dob is 12 Mar 1980", "12 Mar 1980"),
+        ("I was born on 12 March 1980", "12-Mar-1980"),
+        ("my date of birth is 05/01/1980", "05-Jan-1980"),
+        ("1980-03-12", "12-Mar-1980"),
+        ("I was born in 1980", "born in 1980"),  # year only: never invented
+        ("my dob is 12 Mar 1980", "12-Mar-1980"),
     ],
 )
-def test_supported_dob_formats_are_preserved_verbatim(text, expected):
+def test_supported_dob_formats_are_normalized(text, expected):
     assert _pending_age_fields(text)["patient_age"] == expected
 
 
@@ -717,9 +741,9 @@ def test_incomplete_dob_is_not_stored(text):
     assert "dob_age_conflict" not in fields
 
 
-def test_dob_only_answer_is_stored_verbatim_without_a_derived_age():
+def test_dob_only_answer_is_normalized_without_a_derived_age():
     fields = _pending_age_fields("my date of birth is 12 March 1980")
-    assert fields["patient_age"] == "12 March 1980"
+    assert fields["patient_age"] == "12-Mar-1980"
     # The stored value is the DOB itself, never an invented age in years.
     assert not fields["patient_age"].isdigit()
 
@@ -1208,6 +1232,7 @@ def test_hindi_additional_symptom_is_appended_not_replacing():
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
     workflow.process_turn("I took Lantus and have a headache.")
     original = engine.case.adverse_event
+    workflow.process_turn("yes")  # Step 4: medication verified
 
     workflow.process_turn("ab mujhe ulti bhi ho rahi hai")
 
@@ -1240,13 +1265,16 @@ def test_hindi_description_survives_later_turns_and_confirmation():
     workflow.process_turn("dobara kahiye")
     assert engine.case.adverse_event == original
 
-    # Reporter role, then the name read-back: the candidate is not committed
-    # until "yes", and the description is untouched throughout.
+    # Reporter role, then the patient details (name and date of birth, per
+    # the approved Step 6B.1): the candidate is not committed until the
+    # combined read-back is confirmed, and the description is untouched
+    # throughout.
     workflow.process_turn("myself")
     workflow.process_turn("Demo Patient")
     assert engine.case.patient_identifier is None
     assert engine.case.adverse_event == original
 
+    workflow.process_turn("27/05/2000")
     workflow.process_turn("yes")
     assert engine.case.patient_identifier == "Demo Patient"
     assert engine.case.adverse_event == original
@@ -1266,42 +1294,48 @@ def _age_pending_engine(case_id: str) -> AEStateEngine:
     return engine
 
 
-def test_spoken_dob_exact_repro_phrase_stores_verbatim_and_advances():
+def test_spoken_dob_exact_repro_phrase_is_normalized_and_advances():
     engine = _age_pending_engine("AE-spoken-dob-repro")
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
 
     result = workflow.process_turn("twenty seven may two thousand")
 
-    # The DOB is stored verbatim - never converted into a derived age.
-    assert engine.case.patient_age == "twenty seven may two thousand"
+    # The DOB is normalized to DD-MMM-YYYY - never converted into a derived
+    # age and never left in the raw spoken form.
+    assert engine.case.patient_age == "27-May-2000"
     assert engine.case.patient_age != str(_TODAY_YEAR - 2000)
     # The workflow advances to the next question instead of re-asking the
-    # age in years.
+    # age in years. The approved order collects the patient contact number
+    # before consent.
     assert result.next_question is not None
-    assert result.next_question[0] == "consent_to_contact"
+    assert result.next_question[0] == "contact_phone"
     assert "How old are you, in years?" not in result.response_text
 
 
 @pytest.mark.parametrize(
     "text,expected",
     [
-        ("twenty seven may two thousand", "twenty seven may two thousand"),
-        ("27 may two thousand", "27 may two thousand"),
+        ("twenty seven may two thousand", "27-May-2000"),
+        ("27 may two thousand", "27-May-2000"),
         (
             "twenty seven may two thousand five",
-            "twenty seven may two thousand five",
+            "27-May-2005",
         ),
         (
             "twenty seven may two thousand and I have a headache",
-            "twenty seven may two thousand",
+            "27-May-2000",
         ),
         (
             "I was born on twenty seven may two thousand",
-            "twenty seven may two thousand",
+            "27-May-2000",
         ),
+        # Decade-style years are complete and unambiguous ("nineteen ninety"
+        # is how 1990 is spoken).
+        ("twenty seven may nineteen ninety", "27-May-1990"),
+        ("twenty seven june nineteen ninety eight", "27-Jun-1998"),
     ],
 )
-def test_spoken_english_dob_is_preserved_verbatim(text, expected):
+def test_spoken_english_dob_is_normalized(text, expected):
     assert _pending_age_fields(text)["patient_age"] == expected
 
 
@@ -1310,7 +1344,6 @@ def test_spoken_english_dob_is_preserved_verbatim(text, expected):
     [
         "may two thousand",  # missing day
         "twenty seven may",  # missing year
-        "twenty seven may nineteen ninety",  # decade form: never guessed
     ],
 )
 def test_ambiguous_spoken_dob_is_not_stored(text):
@@ -1327,16 +1360,17 @@ def test_spoken_dob_conflicting_with_age_asks_one_clarification():
         "I am 20 years old and twenty seven may two thousand"
     )
 
-    # Neither value is silently chosen; both are held for one clarification.
+    # Neither value is silently chosen; both are held for one clarification
+    # (the date of birth in its normalized DD-MMM-YYYY form).
     assert engine.case.patient_age is None
     assert workflow._dob_age_conflict == {
-        "dob": "twenty seven may two thousand",
+        "dob": "27-May-2000",
         "age": "20",
     }
     assert result.next_question is not None
     assert result.next_question[0] == "patient_age"
     prompt = result.next_question[1]
-    assert "twenty seven may two thousand" in prompt
+    assert "27-May-2000" in prompt
     assert "20 years" in prompt
     assert result.human_review_required is False
 
@@ -1399,12 +1433,21 @@ def test_hindi_first_report_canonicalizes_lantus_and_preserves_description():
     result = workflow.process_turn(report)
 
     # The transliterated product is recognized as the demo product, so the
-    # report is NOT terminated as out of scope and intake continues.
+    # report is NOT terminated as out of scope; the documented Step 4
+    # medication verification is asked before reporter identification.
     assert engine.case.product == "Lantus SoloStar"
     assert engine.case.adverse_event == report
     assert "configured for Lantus SoloStar only" not in result.response_text
     assert result.completed is False
-    assert "person who experienced" in result.response_text
+    assert result.next_question is not None
+    assert result.next_question[0] == "product_verification"
+
+    # Step 4 confirmed: intake continues at reporter identification (Step 5).
+    verified = workflow.process_turn("yes")
+    assert "configured for Lantus SoloStar only" not in verified.response_text
+    assert "person who experienced" in verified.response_text
+    assert verified.next_question is not None
+    assert verified.next_question[0] == "reporter_role"
 
 
 def test_hindi_paracetamol_is_still_identified_separately():
@@ -1543,12 +1586,17 @@ def test_solo_star_devanagari_answer_continues_intake():
 
     result = workflow.process_turn("सोलो स्टार के बारे में")
 
-    # Recognised as the demo product: no scope message, intake continues.
+    # Recognised as the demo product: no scope message; the documented Step 4
+    # medication verification is asked before intake continues.
     assert engine.case.product == "Lantus SoloStar"
     assert workflow._out_of_scope_product is None
     assert "configured for Lantus SoloStar only" not in result.response_text
     assert result.next_question is not None
-    assert result.next_question[0] == "adverse_event"
+    assert result.next_question[0] == "product_verification"
+
+    verified = workflow.process_turn("yes")
+    assert verified.next_question is not None
+    assert verified.next_question[0] == "adverse_event"
 
 
 @pytest.mark.parametrize(
@@ -1591,15 +1639,17 @@ def test_ambiguous_product_reply_asks_again_instead_of_ending():
     engine = AEStateEngine.create_case("AE-ambiguous-product")
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
 
+    # Step 2 is answered so the medication question (Step 3) is on the table.
+    workflow.process_turn("I have a rash")
     result = workflow.process_turn("maybe something?")
 
-    # Nothing guessed, nothing terminated: the product question is re-asked.
+    # Nothing guessed, nothing terminated: the medication question is re-asked.
     assert engine.case.product is None
     assert workflow._out_of_scope_product is None
     assert "configured for Lantus SoloStar only" not in result.response_text
     assert result.next_question is not None
     assert result.next_question[0] == "product"
-    assert "Which medicine or product" in result.response_text
+    assert "Which medicine were you using?" in result.response_text
 
 
 def test_concomitant_medicine_does_not_end_intake():
@@ -1677,20 +1727,22 @@ PATIENT_ID_TRANSCRIPT = "Demo Patient 001"
 
 
 def test_real_entry_spoken_phone_reaches_contact_captured():
-    """Full AE journey through app.main: report -> identity -> name
-    read-back confirmation -> consent -> contact method -> spoken phone,
-    verifying consent precedes contact."""
+    """Full AE journey through app.main: report -> Step 4 verification ->
+    identity -> patient name and date of birth (with combined read-back
+    confirmation) -> spoken phone (with read-back confirmation) -> consent,
+    verifying the patient contact number is captured and confirmed before
+    consent is asked."""
     from app.main import create_app
 
     stt = FakeSTT(
         [
             REAL_AUDIO_1,
-            REAL_AUDIO_2,
-            PATIENT_ID_TRANSCRIPT,
-            "yes",
-            "yes that is fine",
-            "phone please",
-            SPOKEN_PHONE,
+            "yes",  # Step 4: medication verified
+            REAL_AUDIO_2,  # role self + age
+            PATIENT_ID_TRANSCRIPT,  # name; age is known -> combined read-back
+            "yes",  # Step 6B.2: patient details confirmed
+            SPOKEN_PHONE,  # Step 6B.3 -> contact read-back
+            "yes",  # Step 6B.4: contact number confirmed
         ]
     )
     app = create_app(prisma=stt, timbre=FakeTTS())
@@ -1698,47 +1750,44 @@ def test_real_entry_spoken_phone_reaches_contact_captured():
 
     with tempfile.TemporaryDirectory() as tmp:
         one = _post(client, REAL_SESSION_ID, tmp).json()
-        _post(client, REAL_SESSION_ID, tmp)
-        three = _post(client, REAL_SESSION_ID, tmp).json()
-        four = _post(client, REAL_SESSION_ID, tmp).json()
-        five = _post(client, REAL_SESSION_ID, tmp).json()
-        six = _post(client, REAL_SESSION_ID, tmp).json()
-        seven = _post(client, REAL_SESSION_ID, tmp).json()
+        _post(client, REAL_SESSION_ID, tmp)  # Step 4 confirmed
+        _post(client, REAL_SESSION_ID, tmp)  # role + age
+        four = _post(client, REAL_SESSION_ID, tmp).json()  # name -> read-back
+        five = _post(client, REAL_SESSION_ID, tmp).json()  # confirmed
+        six = _post(client, REAL_SESSION_ID, tmp).json()  # phone read-back
+        seven = _post(client, REAL_SESSION_ID, tmp).json()  # phone confirmed
 
-    # Turn 3: the name is read back for confirmation; the case does not
-    # advance to consent before the name is confirmed.
-    assert three["current_state"] == WorkflowState.EVENT_IDENTIFIED.value
-    assert three["next_question"][0] == "confirmation"
-    assert PATIENT_ID_TRANSCRIPT in three["response_text"]
-    assert three["ae"]["collected_information"]["patient_identifier"] is None
+    # Turn 4: the name is held for the combined name-and-date read-back (the
+    # age was captured with Audio 2); the case does not advance before the
+    # details are confirmed.
+    assert four["current_state"] == WorkflowState.PRODUCT_IDENTIFIED.value
+    assert four["next_question"][0] == "confirmation"
+    assert PATIENT_ID_TRANSCRIPT in four["response_text"]
+    assert four["ae"]["collected_information"]["patient_identifier"] is None
 
-    # Turn 4: name confirmed; consent is asked before any contact detail.
+    # Turn 5: patient details confirmed; the contact number is asked next.
     assert (
-        four["ae"]["collected_information"]["patient_identifier"]
+        five["ae"]["collected_information"]["patient_identifier"]
         == PATIENT_ID_TRANSCRIPT
     )
-    assert four["current_state"] == WorkflowState.PATIENT_IDENTIFIED.value
-    assert four["next_question"][0] == "consent_to_contact"
+    assert five["current_state"] == WorkflowState.PATIENT_IDENTIFIED.value
+    assert five["next_question"][0] == "contact_phone"
 
-    # Turn 5: consent given; contact method is now asked.
-    assert five["current_state"] == WorkflowState.CONSENT_CAPTURED.value
-    assert five["next_question"][0] == "contact_method"
+    # Turn 6: the spoken number is extracted and read back before it is
+    # committed (the candidate only, never the case value).
+    assert six["next_question"][0] == "confirmation"
+    assert six["ae"]["extracted_information"]["contact_phone"] == "9886094321"
+    assert six["ae"]["collected_information"]["contact_phone"] is None
 
-    # Turn 6: method recorded; the specific phone number is now asked.
-    assert six["current_state"] == WorkflowState.CONSENT_CAPTURED.value
-    assert six["next_question"][0] == "contact_phone"
-
-    # Turn 7: spoken digits captured as the phone number, contact captured.
+    # Turn 7: contact captured; consent (Step 7) is asked afterwards.
     assert seven["workflow"] == "ae"
     assert seven["intent"] == "unknown"
     assert seven["session_id"] == REAL_SESSION_ID
     assert seven["case_id"] == one["case_id"]
-    extracted = seven["ae"]["extracted_information"]
     collected = seven["ae"]["collected_information"]
-    assert extracted["contact_phone"] == "9886094321"
     assert collected["contact_phone"] == "9886094321"
     assert seven["current_state"] == WorkflowState.CONTACT_CAPTURED.value
-    assert seven["next_question"][0] == "onset_date"
+    assert seven["next_question"][0] == "consent_to_contact"
     assert seven["completed"] is False
 
 
@@ -1915,22 +1964,29 @@ def test_ambiguous_contact_method_reply_stores_nothing():
     )
 
 
-def test_hindi_email_method_advances_to_email_question():
+def test_hindi_consent_answer_advances_to_the_email_question():
     engine = AEStateEngine.create_case("AE-method-hi")
     engine.update("product", "Lantus SoloStar")
     engine.update("adverse_event", "rash")
     engine.update("reporter_role", "self")
     engine.update("patient_identifier", "Alpha Jones")
     engine.update("patient_age", "25")
-    engine.update("consent_to_contact", True)
-    assert engine.next_field()[0] == "contact_method"
+    engine.update("contact_phone", "9999990000")
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
 
-    result = workflow.process_turn("ईमेल चलेगा")
+    # Step 7 consent, answered in Hindi. The approved order collects the
+    # patient contact number before consent, so no contact-method question
+    # is asked; consent then opens the Step 8 email question.
+    consented = workflow.process_turn("हाँ")
+    assert engine.case.consent_to_contact is True
+    assert consented.next_question is not None
+    assert consented.next_question[0] == "contact_email"
 
-    assert engine.case.preferred_contact_method == "email"
-    assert result.next_question is not None
-    assert result.next_question[0] == "contact_email"
+    # Step 8: the email address is offered, requested and captured.
+    workflow.process_turn("yes")
+    workflow.process_turn("demo.patient@example.com")
+    workflow.process_turn("yes")
+    assert engine.case.contact_email == "demo.patient@example.com"
 
 
 # ---- audit: initial free-text description handling ---------------------------
@@ -1989,10 +2045,11 @@ def test_vague_first_message_is_stored_as_unclassified_initial_input():
     # message is preserved verbatim in its own field.
     assert engine.case.adverse_event is None
     assert engine.case.unclassified_initial_input == vague
-    # Intake proceeds with the product question.
-    assert "Which medicine or product" in result.response_text
+    # Intake proceeds with the documented Step 2 invitation.
+    assert "Please tell me what happened, in your own words." in result.response_text
 
     # A later structured answer never overwrites the original wording.
+    workflow.process_turn("I have a rash")
     workflow.process_turn("lantus")
     assert engine.case.product == "Lantus SoloStar"
     assert engine.case.unclassified_initial_input == vague
@@ -2007,7 +2064,8 @@ def test_repeated_unclear_event_replies_park_review_with_empty_field():
     # become the description, and the clarification loop must stay bounded.
     first = workflow.process_turn("ok")
     assert engine.current_state is not WorkflowState.HUMAN_REVIEW
-    assert "side effect or reaction" in first.response_text
+    # The documented Step 2 invitation is the first question asked.
+    assert "Please tell me what happened, in your own words." in first.response_text
 
     second = workflow.process_turn("ok")
     assert engine.current_state is not WorkflowState.HUMAN_REVIEW
@@ -2027,6 +2085,9 @@ def test_unclear_product_replies_park_review_without_scope_stop():
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
 
     workflow.process_turn("kuch gadbad ho rahi hai")
+    # Step 2 answered, so the unclear replies below are answers to the
+    # medication question (Step 3).
+    workflow.process_turn("I have a rash")
     second = workflow.process_turn("shayad")
     assert engine.current_state is not WorkflowState.HUMAN_REVIEW
     assert "didn't catch the product name" in second.response_text

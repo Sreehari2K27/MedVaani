@@ -124,10 +124,24 @@ check(
 
 state = handleUserInput(state, "yesterday morning"); // onset (valid)
 state = handleUserInput(state, "No"); // seriousness
-state = handleUserInput(state, "No"); // medical care
-state = handleUserInput(state, "It is getting better"); // outcome -> finish
+state = handleUserInput(state, "No"); // medical care -> report prepared (no outcome question)
 
 check(state.finished === true, "journey finishes after the final step");
+check(
+  AE_STEPS.every((s) => s.id !== "outcome") &&
+    state.messages.every(
+      (m) => !(m.text ?? "").includes("How are you feeling now"),
+    ),
+  "no post-documentation outcome question is asked after the report",
+);
+check(
+  lastAssistantText(state).includes("qualified human reviewer"),
+  "conversation ends with the existing closing message after the report",
+);
+check(
+  summaryOf(state).role === "summary",
+  "the report summary is displayed before the closing message",
+);
 
 const summary = summaryOf(state);
 check(
@@ -163,8 +177,7 @@ invalidOnsetState = handleUserInput(invalidOnsetState, "Phone");
 invalidOnsetState = handleUserInput(invalidOnsetState, "9876543210");
 invalidOnsetState = handleUserInput(invalidOnsetState, "No"); // invalid onset
 invalidOnsetState = handleUserInput(invalidOnsetState, "Yes");
-invalidOnsetState = handleUserInput(invalidOnsetState, "Yes");
-invalidOnsetState = handleUserInput(invalidOnsetState, "Recovered");
+invalidOnsetState = handleUserInput(invalidOnsetState, "Yes"); // medical care -> finish
 
 const invalidSummary = summaryOf(invalidOnsetState);
 check(

@@ -51,16 +51,21 @@ class WorkflowState(str, Enum):
 
 # Normal-progression states in interview order. CASE_COMPLETED and
 # HUMAN_REVIEW are terminal / forced and never reached by auto-advance.
+# The documented AE voice flow asks for the event description first, then the
+# medication, collects the contact number before consent, and screens
+# seriousness before the incident date, so EVENT_IDENTIFIED precedes
+# PRODUCT_IDENTIFIED, CONTACT_CAPTURED precedes CONSENT_CAPTURED and
+# SERIOUSNESS_SCREENED precedes EVENT_TIMING_CAPTURED.
 _PROGRESSION: tuple[WorkflowState, ...] = (
     WorkflowState.CASE_CREATED,
-    WorkflowState.PRODUCT_IDENTIFIED,
     WorkflowState.EVENT_IDENTIFIED,
+    WorkflowState.PRODUCT_IDENTIFIED,
     WorkflowState.REPORTER_IDENTIFIED,
     WorkflowState.PATIENT_IDENTIFIED,
-    WorkflowState.CONSENT_CAPTURED,
     WorkflowState.CONTACT_CAPTURED,
-    WorkflowState.EVENT_TIMING_CAPTURED,
+    WorkflowState.CONSENT_CAPTURED,
     WorkflowState.SERIOUSNESS_SCREENED,
+    WorkflowState.EVENT_TIMING_CAPTURED,
     WorkflowState.OUTCOME_CAPTURED,
     WorkflowState.OPTIONAL_DETAILS,
     WorkflowState.CASE_REVIEW,
@@ -68,7 +73,8 @@ _PROGRESSION: tuple[WorkflowState, ...] = (
 
 # Which field keys must be captured to satisfy each state. Every key listed
 # for a state must be satisfied (_state_satisfied uses all(...)); the contact
-# group is special-cased in _group_satisfied so contact is phone OR email.
+# group is special-cased in _group_satisfied: it is the patient contact
+# number, which the flow collects before consent is ever asked.
 _STATE_REQUIREMENTS: dict[WorkflowState, tuple[str, ...]] = {
     WorkflowState.PRODUCT_IDENTIFIED: ("product",),
     WorkflowState.EVENT_IDENTIFIED: ("adverse_event",),
@@ -78,7 +84,11 @@ _STATE_REQUIREMENTS: dict[WorkflowState, tuple[str, ...]] = {
     WorkflowState.CONSENT_CAPTURED: ("consent_to_contact",),
     WorkflowState.EVENT_TIMING_CAPTURED: ("onset_date",),
     WorkflowState.SERIOUSNESS_SCREENED: ("seriousness",),
-    WorkflowState.OUTCOME_CAPTURED: ("outcome",),
+    # The outcome is no longer an interview question: once the applicable
+    # information is collected, the report is generated without asking how
+    # the person is feeling. A volunteered outcome is still captured; when
+    # none is given the field stays unset (unknown).
+    WorkflowState.OUTCOME_CAPTURED: (),
     WorkflowState.OPTIONAL_DETAILS: (),
     WorkflowState.CASE_REVIEW: (),
     WorkflowState.CASE_CREATED: (),
@@ -87,53 +97,76 @@ _STATE_REQUIREMENTS: dict[WorkflowState, tuple[str, ...]] = {
 def _question_for(key: str, case: "AECase") -> str:
     """Plain, person-aware phrasing for the next missing field.
 
-    When the person is reporting for themselves we speak in the second
-    person ("you"); only when they are reporting on behalf of someone else do
-    we use third person ("the patient"). Technical PV wording ("adverse
-    event", "reporter") is never shown to the person.
+    Wording follows the documented AE voice flow: one clear spoken question
+    per field, second person ("you") unless the person is reporting on behalf
+    of someone else, in which case the patient is referred to in the third
+    person. Technical PV wording ("adverse event", "reporter") is never shown
+    to the person.
     """
     third_person = case.reporter_role == "someone_else"
     if key == "product":
-        return "Which medicine or product do you think may have caused this?"
+        return "Could you tell me the name of the medication involved?"
     if key == "adverse_event":
-        return "Can you tell me what side effect or reaction you noticed?"
+        return (
+            "Please tell me what happened, in your own words. "
+            "Take your time\u2014I'm listening."
+        )
     if key == "reporter_role":
         return (
-            "Are you the person who experienced this, or are you reporting it "
-            "for someone else?"
+            "May I ask whether you're the person who experienced this event, "
+            "or whether you're reporting it on someone else's behalf?"
         )
     if key == "patient_identifier":
+        # No date format is dictated: accepted formats are handled by the
+        # extraction layer and stored dates are normalized to DD-MMM-YYYY.
+        if third_person:
+            return (
+                "Could you please tell me the patient's first and last name, "
+                "along with their date of birth?"
+            )
         return (
-            "What is the patient's full name?"
-            if third_person
-            else "May I have your first and last name?"
+            "Could you please tell me your first and last name, along with "
+            "your date of birth?"
         )
     if key == "patient_age":
-        return (
-            "How old is the patient, or what is their date of birth?"
-            if third_person
-            else "How old are you, or what is your date of birth?"
-        )
+        # Continuation of the combined name-and-date-of-birth question when
+        # only the name was given: the date of birth is still outstanding.
+        if third_person:
+            return "Could you please tell me the patient's date of birth?"
+        return "Could you please tell me your date of birth?"
     if key == "reporter_name":
-        return "And what is your name?"
+        return "Could you please tell me your full name?"
+    if key == "reporter_contact_phone":
+        return "Could you please share your contact number?"
     if key == "consent_to_contact":
-        return "If we need a little more information later, is it alright if we contact you?"
+        return (
+            "Would it be okay for the appropriate team to contact the patient "
+            "about this report if any follow-up is needed?"
+        )
     if key == "contact_method":
         return "Would you prefer to be contacted by phone, by email, or both?"
     if key == "contact_phone":
-        return "What phone number would you like us to use?"
+        if third_person:
+            return "Could you please share the patient's contact number?"
+        return "Could you please share the best contact number for you?"
     if key == "contact_email":
-        return "What email address would you like us to use?"
+        # Kept in sync with EMAIL_REQUEST_QUESTION in the conversation
+        # service: dictated/spelled addresses are invited explicitly.
+        return (
+            "Could you please spell out your email address, one letter or "
+            "number at a time? You can say 'at the rate' for @ and 'dot' for "
+            "a period."
+        )
     if key == "onset_date":
-        return "When did the side effect first start?"
+        return "Could you tell me when the event occurred?"
     if key == "seriousness":
-        return "Would you consider this problem serious?"
+        return "Would you say that the event was severe or life-threatening?"
     if key == "outcome":
         return (
-            "How is the patient feeling now—have the symptoms improved, "
+            "How is the patient feeling now\u2014have the symptoms improved, "
             "stayed the same, or gotten worse?"
             if third_person
-            else "How are you feeling now—have your symptoms improved, "
+            else "How are you feeling now\u2014have your symptoms improved, "
             "stayed the same, or gotten worse?"
         )
     return f"Could you tell me a bit more about the {key.replace('_', ' ')}?"
@@ -222,8 +255,15 @@ class AECase:
     patient_sex: str | None = None
     reporter_role: str | None = None
     reporter_name: str | None = None
+    # The reporter's own contact number, kept apart from the patient's
+    # ``contact_phone`` so a report on someone else's behalf never mixes the
+    # two identities or the two numbers.
+    reporter_contact_phone: str | None = None
     contact_phone: str | None = None
     contact_email: str | None = None
+    # Explicit refusal of the optional email question. Consent to follow-up
+    # contact can still be "yes" while the email address stays unavailable.
+    contact_email_declined: bool = False
     preferred_contact_method: str | None = None
     consent_to_contact: bool | None = None
     onset_date: str | None = None
@@ -303,7 +343,13 @@ class AEStateEngine:
             return False
         role = self.case.reporter_role
         if role == "someone_else":
-            return bool(self.case.reporter_name)
+            # Reporting on someone else's behalf: the reporter's own name and
+            # contact number are both collected before patient details.
+            if self.case.pending_confirmation == "reporter_contact_phone":
+                return False
+            return bool(self.case.reporter_name) and bool(
+                self.case.reporter_contact_phone
+            )
         if role == "self":
             # Reporter is the patient: the patient identity is not duplicated.
             return bool(self.case.patient_identifier)
@@ -316,8 +362,8 @@ class AEStateEngine:
         if self.case.pending_confirmation == key:
             return False
         if key == "contact_group":
-            # Declining contact is a valid, terminal answer: contact is then
-            # optional and the state still advances (no infinite consent loop).
+            # The patient contact number is collected before consent is asked
+            # (see the documented flow); it is a required interview answer.
             return self._contact_complete()
         if key == "seriousness":
             return self.case.seriousness in {"yes", "no"}
@@ -329,45 +375,19 @@ class AEStateEngine:
     # ---- required information / next question -----------------------------
 
     def _contact_complete(self) -> bool:
-        """Whether the requested contact channel(s) have been captured.
+        """Whether the patient contact number has been captured.
 
-        Declining contact satisfies the group (contact becomes optional). When
-        the person asked for phone, email, or both, the corresponding value(s)
-        must be present; a pending read-back keeps the field unsatisfied.
+        The contact number is asked for before consent is ever raised, so it
+        is required regardless of the consent answer. A pending read-back
+        keeps the field unsatisfied until the number is confirmed.
         """
-        if self.case.consent_to_contact is False:
-            return True
-        if self.case.consent_to_contact is not True:
+        if self.case.pending_confirmation == "contact_phone":
             return False
-        method = self.case.preferred_contact_method
-        if method == "phone":
-            return bool(self.case.contact_phone)
-        if method == "email":
-            return bool(self.case.contact_email)
-        if method == "both":
-            return bool(self.case.contact_phone and self.case.contact_email)
-        # No channel chosen yet: any captured detail satisfies (legacy).
-        return bool(self.case.contact_phone or self.case.contact_email)
+        return bool(self.case.contact_phone)
 
     def _contact_pending(self) -> list[str]:
-        """Keys still needed to reach the person, honouring consent + method."""
-        if self.case.consent_to_contact is not True:
-            return []
-        method = self.case.preferred_contact_method
-        if method == "phone":
-            return [] if self.case.contact_phone else ["contact_phone"]
-        if method == "email":
-            return [] if self.case.contact_email else ["contact_email"]
-        if method == "both":
-            pending: list[str] = []
-            if not self.case.contact_phone:
-                pending.append("contact_phone")
-            if not self.case.contact_email:
-                pending.append("contact_email")
-            return pending
-        if self.case.contact_phone or self.case.contact_email:
-            return []
-        return ["contact_method"]
+        """Keys still needed to reach the patient (asked before consent)."""
+        return [] if self._contact_complete() else ["contact_phone"]
 
     def _unsatisfied_groups(self) -> list[str]:
         # No early "pause" shortcut here: a pending confirmation keeps its
@@ -379,8 +399,20 @@ class AEStateEngine:
                 role = self.case.reporter_role
                 if role is None:
                     groups.append("reporter_role")
-                elif role == "someone_else" and not self.case.reporter_name:
-                    groups.append("reporter_name")
+                elif role == "someone_else":
+                    # Reporter branch: name, then the reporter's own contact
+                    # number, both before any patient detail is asked.
+                    if (
+                        not self.case.reporter_name
+                        or self.case.pending_confirmation == "reporter_name"
+                    ):
+                        groups.append("reporter_name")
+                    elif (
+                        not self.case.reporter_contact_phone
+                        or self.case.pending_confirmation
+                        == "reporter_contact_phone"
+                    ):
+                        groups.append("reporter_contact_phone")
                 continue
             if state is WorkflowState.CONTACT_CAPTURED:
                 groups.extend(self._contact_pending())
@@ -402,10 +434,27 @@ class AEStateEngine:
         # interpolated unchanged (names, digits, addresses are never altered).
         if field == "patient_identifier":
             name = self.case.confirmation_candidate.get('patient_identifier', self.case.patient_identifier or '')
-            return f"I heard {name}. Is that correct?"
-        if field == "contact_phone":
-            phone = self.case.confirmation_candidate.get('contact_phone', self.case.contact_phone or '')
-            return f"I heard your phone number as {phone}. Is that correct?"
+            dob = self.case.patient_age
+            if not dob:
+                # Only the name is known so far: the date of birth is still
+                # collected (the combined question) before any read-back.
+                return None
+            if self.case.reporter_role == "someone_else":
+                return (
+                    "Let me read that back to make sure I've recorded it "
+                    f"correctly: {name}, {dob}. Is that right?"
+                )
+            return f"I have your details as {name}, {dob}. Is that correct?"
+        if field == "reporter_name":
+            name = self.case.confirmation_candidate.get('reporter_name', self.case.reporter_name or '')
+            return f"I have your name as {name}. Have I got that right?"
+        if field in ("contact_phone", "reporter_contact_phone"):
+            phone = self.case.confirmation_candidate.get(
+                field, getattr(self.case, field, '') or ''
+            )
+            digits = "".join(ch for ch in str(phone) if ch.isdigit())
+            tail = digits[-4:] if len(digits) >= 4 else digits
+            return f"I have the number ending in {tail}. Is that correct?"
         if field == "contact_email":
             email = self.case.confirmation_candidate.get('contact_email', self.case.contact_email or '')
             return f"I heard your email address as {email}. Is that correct?"
@@ -428,6 +477,14 @@ class AEStateEngine:
                 return self.case.pending_confirmation, _question_for(
                     self.case.pending_confirmation, self.case
                 )
+            if (
+                self.case.pending_confirmation == "patient_identifier"
+                and not self.case.patient_age
+            ):
+                # Name held for the combined name-and-date-of-birth read-back:
+                # collect the outstanding date of birth first (the read-back
+                # happens once both values are known).
+                return "patient_age", _question_for("patient_age", self.case)
             q = self._confirmation_question()
             if q:
                 return ('confirmation', q)
@@ -468,6 +525,12 @@ class AEStateEngine:
             if not isinstance(value, bool):
                 raise AECaseValidationError("consent_to_contact must be a boolean.")
             self.case.consent_to_contact = value
+        elif field == "contact_email_declined":
+            if not isinstance(value, bool):
+                raise AECaseValidationError(
+                    "contact_email_declined must be a boolean."
+                )
+            self.case.contact_email_declined = value
         elif field in _ALLOWED_VALUES:
             self._set_checked(field, value, _ALLOWED_VALUES[field])
         else:
@@ -476,8 +539,10 @@ class AEStateEngine:
             setattr(self.case, field, value.strip())
 
         if field == "reporter_role" and value == "self":
-            # Reporter is the patient: do not keep a duplicate reporter name.
+            # Reporter is the patient: do not keep a duplicate reporter name
+            # or a duplicate reporter contact number.
             self.case.reporter_name = None
+            self.case.reporter_contact_phone = None
 
         if field == "onset_date":
             # A new/corrected statement invalidates the derived interpretation;
@@ -498,14 +563,16 @@ class AEStateEngine:
 
     # ---- explicit confirmation ---------------------------------------------
 
-    def begin_confirmation(self, field: str, candidate: str) -> str:
+    def begin_confirmation(self, field: str, candidate: str) -> str | None:
         """Capture ``candidate`` for ``field`` and enter the read-back state.
 
         The candidate is stored in ``confirmation_candidate`` and is NOT
         written to the case until the read-back is answered affirmatively.
         While a confirmation is pending, ``next_field()`` asks the read-back
         question and the workflow cannot advance past (or complete on) this
-        field. Returns the read-back question to ask.
+        field. Returns the read-back question to ask, or ``None`` when the
+        read-back itself is still waiting for another value (the combined
+        name-and-date-of-birth read-back).
         """
         if field in _IMMUTABLE_FIELDS:
             raise AECaseValidationError(f"Field '{field}' cannot be confirmed.")
@@ -522,9 +589,7 @@ class AEStateEngine:
         self.case.confirmation_candidate = {field: candidate.strip()}
         self.case.confirmation_response = None
         self.case.confirmed_fields.discard(field)
-        question = self._confirmation_question()
-        assert question is not None  # pending_confirmation was just set
-        return question
+        return self._confirmation_question()
 
     def respond_to_confirmation(self, reply: str) -> str | None:
         """Answer a pending read-back. Returns the next question to ask.
@@ -672,7 +737,9 @@ class AEStateEngine:
             },
             "contact": {
                 "phone": self.case.contact_phone,
+                "reporter_phone": self.case.reporter_contact_phone,
                 "email": self.case.contact_email,
+                "email_declined": self.case.contact_email_declined,
                 "preferred_method": self.case.preferred_contact_method,
                 "consent_to_contact": self.case.consent_to_contact,
             },

@@ -25,7 +25,6 @@ const STAGE_DONE: Record<AeStageId, (info: AeCollectedInfo, completed: boolean) 
   consent: (info) => info.consent_to_contact === true,
   "event-timing": (info) => asString(info.onset_date) !== null,
   seriousness: (info) => info.seriousness === "yes" || info.seriousness === "no",
-  outcome: (info) => asString(info.outcome) !== null,
   review: (_info, completed) => completed,
 };
 
@@ -68,7 +67,6 @@ const MISSING_LABELS: Record<string, string> = {
   onset_date: "Event timing",
   medical_care: "Medical care",
   seriousness: "Seriousness",
-  outcome: "Outcome",
 };
 
 export function missingLabels(keys: string[]): string[] {
@@ -93,11 +91,16 @@ export function buildLiveSummary(collected: AeCollectedInfo | null | undefined):
 
   if (product) rows.push({ label: "Product", value: product });
   if (events) rows.push({ label: "Reported events", value: events });
-  if (identifier) {
-    rows.push({
-      label: "Patient",
-      value: age ? `${identifier} (age ${age})` : identifier,
-    });
+  // Patient identity: the name and the date of birth are separate, correctly
+  // labelled fields. A stored date of birth is never displayed as an age;
+  // only a stored numeric age is shown as an age (no age is calculated).
+  if (identifier) rows.push({ label: "Patient", value: identifier });
+  if (age) {
+    if (/^\d{1,3}$/.test(age)) {
+      rows.push({ label: "Age", value: `${age} years` });
+    } else {
+      rows.push({ label: "Date of birth", value: age });
+    }
   }
   if (onset) {
     // Readable calendar date (DD-MMM-YYYY) with the reported wording retained;
@@ -114,7 +117,17 @@ export function buildLiveSummary(collected: AeCollectedInfo | null | undefined):
   }
   const contact = [phone, email].filter(Boolean).join(" · ");
   if (contact) rows.push({ label: "Contact", value: contact });
-  rows.push({ label: "Consent", value: info.consent_to_contact === true ? "Yes" : "No" });
+  // Consent is only "No" when it was explicitly declined: an unanswered
+  // consent field is reported as not provided and never silently converted.
+  rows.push({
+    label: "Consent",
+    value:
+      info.consent_to_contact === true
+        ? "Yes"
+        : info.consent_to_contact === false
+          ? "No"
+          : "Not provided",
+  });
   if (seriousness && seriousness !== "unknown") {
     rows.push({ label: "Seriousness", value: seriousness });
   }

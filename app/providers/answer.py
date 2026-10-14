@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional
 
 from .base import LLMResult
 from .mock import MockLLMProvider
+from app.workflow.onset import format_report_date
 
 # Intents the base provider has already fully interpreted; the answer parser
 # must not re-parse those messages.
@@ -32,6 +33,27 @@ _BASE_INTERPRETED = frozenset(
 )
 
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[A-Za-z]{2,}")
+
+# Final-connection-domain labels accepted for dictated/spelled addresses, so
+# ordinary speech that merely contains "at" and "dot" can never become an
+# address ("look at this dot on my arm" ends in "onmyarm", which is not a
+# recognised top-level/domain label).
+_EMAIL_TLDS = frozenset(
+    {
+        "com", "net", "org", "co", "in", "edu", "gov", "mil", "int", "io", "ai",
+        "me", "info", "biz", "uk", "us", "ca", "au", "de", "fr", "nl", "jp",
+        "cn", "br", "za", "sg", "ae", "tv", "xyz", "online", "site", "tech",
+    }
+)
+
+# Provider/domain words that legitimately appear inside a dictated address.
+_EMAIL_DICTATION_WORDS = frozenset(
+    {
+        "gmail", "googlemail", "yahoo", "ymail", "hotmail", "outlook",
+        "protonmail", "proton", "icloud", "mail", "email", "live",
+        "rocketmail", "zoho", "aol", "msn",
+    }
+)
 # Deterministic dictation forms of an email address: a short known lead-in is
 # dropped first, "at the rate" / a standalone "at" dictate "@", a standalone
 # "dot" dictates ".", and spacing directly around those components is removed.
@@ -180,8 +202,8 @@ _REPORT_LANGUAGE = re.compile(
 )
 _SYMPTOM_LANGUAGE = re.compile(
     r"\b(headache|nausea|nauseous|vomit\w*|rash|hives|swell\w*|swollen|dizz\w*|"
-    r"fever|pain\w*|bleed\w*|cramp\w*|diarrh\w*|itch\w*|sore\w*|tired|fatigue\w*|"
-    r"breath\w*|blurr\w*|symptom\w*|reaction)\b"
+    r"fever|pain\w*|bleed\w*|cramp\w*|diarrh\w*|itch\w*|sore\w*|tired|fatigue|"
+    r"breath\w*|blurr\w*|symptom\w*|reaction|ache|aches)\b"
     # Romanised Hindi symptoms (unambiguous; \b-guarded so English words like
     # "ultimately" can never match "ulti").
     r"|(?:dard|ulti|khujli|bukhar|chakkar|sujan|thakan)\b"
@@ -253,6 +275,11 @@ _ROLE_SELF = re.compile(
     # purpose: "I'm the one reporting for my wife" stays OTHER).
     r"|\b(?:i\s+am|i'?m|im)\s+the\s+one(?:\s+who)?(?:'s|\s+is|\s+was)?\s+"
     r"(?:experienc\w*|having|facing|going\s+through|suffering)"
+    # "the patient who experienced this event" (any leading filler, e.g.
+    # "and the patient who experienced this event").
+    r"|\bpatient\s+who\s+experienced\b"
+    # "I experienced it / I experienced this".
+    r"|\bi\s+experienced\s+(?:it|this|firsthand|anything)\b"
     # "it is I myself": "main hi patient hoon", "नहीं मैं ही पेशेंट हूँ।".
     r"|\b(?:main|mai)\s+hi\s+(?:patient|h(?:oon|u|n))\b"
     # "it's my own experience": "mera hi anubhav", "apna hi anubhav".
@@ -268,6 +295,9 @@ _ROLE_SELF = re.compile(
 _ROLE_OTHER = re.compile(
     r"\b(someone else|not the patient|my\s+(?:wife|husband|son|daughter|mother|father|"
     r"mom|dad|parent|caregiver|pharmacist|doctor|nurse|relative|friend|partner|colleague))\b"
+    # "on behalf of someone else", "reporting this for another person".
+    r"|\b(?:on\s+behalf\s+of|for)\s+another\s+(?:person|individual|patient)\b"
+    r"|\breporting\s+(?:this\s+)?for\s+(?:another|someone\s+else)\b"
     # Hindi / Romanized-Hindi someone-else answers: possessive + kinship
     # (including mixed "meri wife"), the "reporting for someone else"
     # phrasings, and the bare "someone else" form anchored to the whole reply.
@@ -465,15 +495,105 @@ def _extract_spoken_phone(text: str) -> str | None:
     return best
 
 
+def _spelled_email(text: str) -> str | None:
+    """A spelled/dictated email address, or ``None`` when clearly not one.
+
+    Handles individually spoken letters and digits separated by transcript
+    punctuation ("S, R, E, E, H, A, R, I, at the rate, Gmail, dot, com" ->
+    ``sreehari@gmail.com``), whole-word local parts ("srihari at gmail dot
+    com"), spoken ``underscore``/``hyphen`` and the ``at the rate`` / ``at``
+    / ``dot`` cues. Character order is preserved exactly; nothing is guessed.
+    Both an ``@`` cue and a ``dot`` cue must be present, and the result must
+    be a single valid address ending in a recognised domain label, so
+    ordinary speech never becomes an address.
+    """
+    work = (text or "").strip().lower()
+    if not work:
+        return None
+    # Correction leads ("no, the email should be ...", "it should be ...").
+    work = re.sub(r"^\s*(?:no|nope)[,\s!]+", "", work)
+    work = re.sub(
+        r"^\s*(?:(?:my|the)?\s*(?:e-?mail(?:\s+address)?|mail\s+address|address)"
+        r"|it'?s|that'?s|it|that)?\s*(?:should\s+be|is|:)?\s*",
+        "",
+        work,
+    )
+    # The phrase cue becomes the "@" token before tokenising.
+    work = re.sub(r"\bat\s+the\s+rate\b", "@", work)
+    has_at = bool(re.search(r"\bat\b|@", work))
+    has_dot = bool(re.search(r"\bdot\b|\.", work))
+    if not (has_at and has_dot):
+        return None
+
+    out: list[str] = []
+    seen_at = False
+    local_letters = False
+    local_words = False
+    for raw in re.split(r"[\s,;]+", work):
+        token = raw.strip(" .!?;:")
+        if not token:
+            continue
+        if token == "@" or token == "at":
+            if seen_at or not out:
+                return None  # ambiguous or leading "@"
+            out.append("@")
+            seen_at = True
+            continue
+        if token == "dot":
+            out.append(".")
+            continue
+        if token == "underscore":
+            out.append("_")
+            continue
+        if token in ("hyphen", "dash"):
+            out.append("-")
+            continue
+        digit = _spoken_digit_lookup(token)
+        if digit is not None:
+            out.append(digit)
+            continue
+        if not seen_at:
+            # The local part must be either fully spelled ("s, r, e, e") or
+            # whole words ("sreehari", "john.doe_work"): mixing the two is
+            # ambiguous speech and is never guessed. Symbol cues (dot,
+            # underscore, hyphen) and spoken digits count as neither.
+            if re.fullmatch(r"[a-z]", token):
+                local_letters = True
+            elif re.fullmatch(r"[a-z]{2,}", token):
+                local_words = True
+        if re.fullmatch(r"[a-z]", token) or token.isdigit():
+            out.append(token)
+            continue
+        if token in _EMAIL_DICTATION_WORDS or re.fullmatch(r"[a-z]{2,}", token):
+            out.append(token)
+            continue
+        # Not part of an address: stop rather than guess.
+        return None
+    if local_letters and local_words:
+        return None
+
+    candidate = "".join(out)
+    if candidate.count("@") != 1:
+        return None
+    if not _EMAIL.fullmatch(candidate):
+        return None
+    # The final label must be a recognised domain/TLD, which is the strongest
+    # guard against ordinary speech ever becoming an address.
+    if candidate.rsplit(".", 1)[-1] not in _EMAIL_TLDS:
+        return None
+    return candidate
+
+
 def _normalize_spoken_email(text: str) -> str | None:
     """Normalize a dictated email address, or ``None`` when there is none.
 
     A literal address already present in the text is returned exactly as
-    matched (existing behaviour). Otherwise the spoken forms are folded in
-    deterministically: ``"at the rate"`` / a standalone ``"at"`` become
-    ``"@"``, a standalone ``"dot"`` becomes ``"."``, one known lead-in ("my
-    email is", "it's", ...) is dropped, and spacing directly around those
-    components is removed.
+    matched (existing behaviour). Spelled-out addresses ("S, R, E, E, H, A,
+    R, I, at the rate, Gmail, dot, com") are folded in deterministically, and
+    otherwise the existing spoken forms are applied: ``"at the rate"`` / a
+    standalone ``"at"`` become ``"@"``, a standalone ``"dot"`` becomes
+    ``"."``, one known lead-in ("my email is", "it's", ...) is dropped, and
+    spacing directly around those components is removed.
 
     The result is returned only when it fully validates against ``_EMAIL``,
     so nothing is stored otherwise: missing characters are never invented and
@@ -489,7 +609,12 @@ def _normalize_spoken_email(text: str) -> str | None:
     if literal:
         return literal.group(0)
 
-    # 2. Spoken form: one known lead-in, then trailing punctuation.
+    # 2. Spelled-out letters/digits ("S, R, E, E, H, A, R, I, at the rate, ...").
+    spelled = _spelled_email(stripped)
+    if spelled is not None:
+        return spelled
+
+    # 3. Spoken form: one known lead-in, then trailing punctuation.
     work = _EMAIL_LEAD.sub("", stripped, count=1).rstrip(" \t.!?,;")
     work = _SPOKEN_AT_RATE.sub("@", work)
     work = _SPOKEN_AT.sub("@", work)
@@ -511,6 +636,9 @@ def parse_word_number(phrase: str) -> int | None:
 
     Supports whole numbers up to ``<digits> thousand`` and compound forms
     (``"two thousand five"`` -> 2005, ``"one hundred and five"`` -> 105).
+    Digits must appear in descending magnitude: decade-style phrases such as
+    ``"nineteen ninety eight"`` (19 then 90) are rejected instead of being
+    summed into nonsense (117); they are handled by the spoken-year parser.
     Returns ``None`` when the phrase is not a recognised number.
     """
     tokens = [
@@ -523,9 +651,15 @@ def parse_word_number(phrase: str) -> int | None:
     total = 0
     for token in tokens:
         if token in _ONES:
-            total += _ONES[token]
+            value = _ONES[token]
+            if total > 0 and value >= total:
+                return None
+            total += value
         elif token in _TENS:
-            total += _TENS[token]
+            value = _TENS[token]
+            if total > 0 and value >= total:
+                return None
+            total += value
         elif token == "hundred":
             if total == 0:
                 return None
@@ -558,6 +692,16 @@ def _normalise_age(value: str) -> str | None:
     if number is None or not 1 <= number <= _MAX_AGE:
         return None
     return str(number)
+
+
+def _age_rejected_for_dob_question(text: str) -> bool:
+    """A bare 3+ digit answer while a date of birth is pending is not an age.
+
+    Mis-heard date fragments (e.g. ``117``) must never be stored as an age
+    and read back as part of the patient's details; the date-of-birth
+    question is simply asked again.
+    """
+    return bool(re.fullmatch(r"\d{3,}", (text or "").strip()))
 
 
 def _age_from_suffix_clause(clause: str) -> str | None:
@@ -670,8 +814,19 @@ def _extract_devanagari_age(text: str, *, pending: bool = False) -> str | None:
 # as "12/03/2026" are never misread as a date of birth.
 _DOB_CUE = re.compile(r"\b(?:born|birth|dob|date\s+of\s+birth)\b", re.IGNORECASE)
 
-_DOB_MONTH_DATE = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b")
+# A trailing date-of-birth lead-in ("and my date of birth is", "dob:") that
+# must never be stored as part of a name.
+_DOB_NAME_LEAD = re.compile(
+    r"(?i)(?:^|[\s,;&]+)(?:and\s+)?(?:my\s+)?(?:date\s+of\s+birth|dob)\s*(?:is|:)?\s*$"
+)
+
+_DOB_MONTH_DATE = re.compile(
+    r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b", re.IGNORECASE
+)
 _DOB_SLASH = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+# DD-MM-YYYY, the format the flow asks the person to speak/type. Disjoint from
+# _DOB_DASH (YYYY-MM-DD): the four-digit year sits at the end here.
+_DOB_DMY_DASH = re.compile(r"\b(\d{1,2})-(\d{1,2})-(\d{4})\b")
 _DOB_DASH = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
 _DOB_BORN = re.compile(r"\bborn(?:\s+in)?\s+(\d{4})\b", re.IGNORECASE)
 
@@ -696,11 +851,55 @@ _MONTH_NAMES: Dict[str, int] = {
 # (longest first) so only real month names can anchor a match; every
 # component is validated in code before anything is stored.
 _SPOKEN_DOB = re.compile(
-    r"\b(\d{1,2}|[a-z]+(?:\s+[a-z]+)?)\s+("
+    r"\b(\d{1,2}(?:st|nd|rd|th)?|[a-z]+(?:\s+[a-z]+)?)\s+("
     + "|".join(
         re.escape(name) for name in sorted(_MONTH_NAMES, key=len, reverse=True)
     )
     + r")\.?\s+(\d{4}|[a-z]+(?:\s+[a-z]+){0,3})\b",
+    re.IGNORECASE,
+)
+
+# Ordinal day forms spoken by users ("twenty seventh", "27th") are stripped
+# to their cardinal value before parsing; nothing is guessed.
+_ORDINAL_SUFFIX = re.compile(r"(?i)(?:st|nd|rd|th)$")
+
+# Irregular spoken ordinal days ("eighth", "twelfth", "twentieth", "first"):
+# the suffix-strip trick cannot recover these, so they are mapped directly.
+_DAY_ORDINALS: Dict[str, int] = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6,
+    "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10, "eleventh": 11,
+    "twelfth": 12, "thirteenth": 13, "fourteenth": 14, "fifteenth": 15,
+    "sixteenth": 16, "seventeenth": 17, "eighteenth": 18, "nineteenth": 19,
+    "twentieth": 20, "thirtieth": 30,
+}
+
+
+def _spoken_day(value: str) -> Optional[int]:
+    """Parse a spoken or numeric day, tolerating ordinal forms."""
+    text = (value or "").strip().lower()
+    direct = _DAY_ORDINALS.get(text)
+    if direct is not None:
+        return direct
+    parts = text.split()
+    if (
+        len(parts) == 2
+        and parts[0] in ("twenty", "thirty")
+        and parts[1] in _DAY_ORDINALS
+    ):
+        # "twenty eighth" -> 28, "thirty first" -> 31.
+        return (20 if parts[0] == "twenty" else 30) + _DAY_ORDINALS[parts[1]]
+    text = _ORDINAL_SUFFIX.sub("", text).strip()
+    if text.isdigit():
+        return int(text)
+    return parse_word_number(text)
+
+
+# Decade-style spoken years ("nineteen ninety eight" -> 1998, "twenty twenty
+# five" -> 2025). Only these exact shapes are accepted; a partial year such
+# as "nineteen ninety" stays incomplete at the caller and is never guessed.
+_DECADE_YEAR = re.compile(
+    r"^(nineteen|twenty)\s+(eighty|seventy|sixty|fifty|forty|thirty|twenty|ninety)"
+    r"(?:\s+([a-z]+|\d{1,2}))?$",
     re.IGNORECASE,
 )
 
@@ -709,10 +908,36 @@ def _spoken_year(text: str) -> tuple[Optional[int], str]:
     """Parse a spoken/digit year, trusting only the longest parsed prefix.
 
     "two thousand" -> (2000, "two thousand"), "two thousand and five" ->
-    (2005, "two thousand and five"), "2000" -> (2000, "2000"); trailing
-    sentence words ("... and I have a headache") are ignored and the returned
-    text is only the parsed prefix so nothing extra is ever stored.
+    (2005, "two thousand and five"), "2000" -> (2000, "2000"), "nineteen
+    ninety eight" -> (1998, "nineteen ninety eight"); trailing sentence words
+    ("... and I have a headache") are ignored and the returned text is only
+    the parsed prefix so nothing extra is ever stored.
     """
+    # Decade form first ("nineteen ninety eight"): the generic prefix loop
+    # would otherwise accept the leading "nineteen" on its own. A trailing
+    # conjunction ("... and I have a headache") is dropped first.
+    decade_text = re.sub(r"\s+and\s*$", "", text.strip())
+    decade = _DECADE_YEAR.match(decade_text)
+    if decade is not None:
+        prefix = 1900 if decade.group(1).lower() == "nineteen" else 2000
+        tens = _TENS.get(decade.group(2).lower())
+        if tens is not None:
+            year = prefix + tens
+            clean = f"{decade.group(1)} {decade.group(2)}"
+            tail = (decade.group(3) or "").strip()
+            if tail:
+                units = parse_word_number(tail)
+                if units is None:
+                    if tail.isdigit():
+                        units = int(tail)
+                    else:
+                        return None, ""
+                if not 0 <= units <= 9:
+                    return None, ""
+                year += units
+                clean = f"{clean} {tail}"
+            if _dob_year_ok(year):
+                return year, clean
     parts = text.split()
     for size in range(len(parts), 0, -1):
         candidate = " ".join(parts[:size])
@@ -734,14 +959,13 @@ def _dob_year_ok(year: int) -> bool:
     return 1900 <= year <= date.today().year
 
 
-def _extract_dob_with_year(text: str) -> tuple[Optional[str], Optional[int]]:
-    """Return the verbatim DOB found in ``text`` and its birth year.
+def _extract_dob_date(text: str) -> tuple[Optional[date], Optional[str]]:
+    """Return the calendar date of birth found in ``text`` and its verbatim form.
 
-    Supports DD Month YYYY (with named months only), DD/MM/YYYY, YYYY-MM-DD,
-    "born YYYY", and the spoken-English form "twenty seven may two thousand".
-    Missing components are never invented and implausible values (unknown
-    month name, day/month out of range, year outside 1900..current year) are
-    rejected rather than guessed at.
+    Only a fully specified, valid calendar date is returned; "born 1990"
+    (year only) yields ``(None, ...)`` because a day and month are never
+    invented. Implausible values (unknown month, day/month out of range, year
+    outside 1900..current year) are rejected rather than guessed at.
     """
     match = _DOB_MONTH_DATE.search(text)
     if match is not None:
@@ -749,11 +973,11 @@ def _extract_dob_with_year(text: str) -> tuple[Optional[str], Optional[int]]:
         year = int(match.group(3))
         if month is not None and _dob_year_ok(year):
             try:
-                date(year, month, int(match.group(1)))
+                parsed = date(year, month, int(match.group(1)))
             except ValueError:
                 pass  # e.g. "31 February": fall through to the other formats
             else:
-                return match.group(0), year
+                return parsed, match.group(0)
     match = _DOB_SLASH.search(text)
     if match is not None:
         day, month, year = (
@@ -763,11 +987,25 @@ def _extract_dob_with_year(text: str) -> tuple[Optional[str], Optional[int]]:
         )
         if _dob_year_ok(year):
             try:
-                date(year, month, day)
+                parsed = date(year, month, day)
+            except ValueError:
+                pass  # e.g. "31/02/1990": fall through to the other formats
+            else:
+                return parsed, match.group(0)
+    match = _DOB_DMY_DASH.search(text)
+    if match is not None:
+        day, month, year = (
+            int(match.group(1)),
+            int(match.group(2)),
+            int(match.group(3)),
+        )
+        if _dob_year_ok(year):
+            try:
+                parsed = date(year, month, day)
             except ValueError:
                 pass
             else:
-                return match.group(0), year
+                return parsed, match.group(0)
     match = _DOB_DASH.search(text)
     if match is not None:
         year, month, day = (
@@ -777,29 +1015,49 @@ def _extract_dob_with_year(text: str) -> tuple[Optional[str], Optional[int]]:
         )
         if _dob_year_ok(year):
             try:
-                date(year, month, day)
+                parsed = date(year, month, day)
             except ValueError:
                 pass
             else:
-                return match.group(0), year
-    match = _DOB_BORN.search(text)
-    if match is not None and _dob_year_ok(int(match.group(1))):
-        return match.group(0), int(match.group(1))
+                return parsed, match.group(0)
     # Spoken-English form ("twenty seven may two thousand"). Every component
-    # must parse; nothing is guessed and only the parsed prefix is stored.
+    # must parse; nothing is guessed and only the parsed components are kept.
     for match in _SPOKEN_DOB.finditer(text):
-        day_text = match.group(1)
-        day = int(day_text) if day_text.isdigit() else parse_word_number(day_text)
+        day = _spoken_day(match.group(1))
         month = _MONTH_NAMES.get(match.group(2).lower())
         year, year_text = _spoken_year(match.group(3))
         if day is None or month is None or year is None or not _dob_year_ok(year):
             continue
         try:
-            date(year, month, day)
+            parsed = date(year, month, day)
         except ValueError:
             continue
-        # Only the successfully parsed components are stored verbatim.
-        return f"{match.group(1)} {match.group(2)} {year_text}", year
+        return parsed, f"{match.group(1)} {match.group(2)} {year_text}"
+    return None, None
+
+
+def normalized_dob_in(text: str) -> Optional[str]:
+    """The date of birth in ``text`` normalized to ``DD-MMM-YYYY``, or None."""
+    parsed, _verbatim = _extract_dob_date(text or "")
+    if parsed is None:
+        return None
+    return format_report_date(parsed)
+
+
+def _extract_dob_with_year(text: str) -> tuple[Optional[str], Optional[int]]:
+    """Return the verbatim DOB found in ``text`` and its birth year.
+
+    Supports DD Month YYYY (with named months only), DD/MM/YYYY, DD-MM-YYYY,
+    YYYY-MM-DD, "born YYYY", and the spoken-English form "twenty seven may
+    two thousand". Callers that STORE a DOB must use ``normalized_dob_in``
+    instead so structured case data is always ``DD-MMM-YYYY``.
+    """
+    parsed, verbatim = _extract_dob_date(text)
+    if parsed is not None:
+        return verbatim, parsed.year
+    match = _DOB_BORN.search(text)
+    if match is not None and _dob_year_ok(int(match.group(1))):
+        return match.group(0), int(match.group(1))
     return None, None
 
 
@@ -1099,13 +1357,25 @@ def _parse_answer(text: str, allow_bare_dob: bool = False) -> Dict[str, Any]:
     dob: Optional[str] = None
     dob_year: Optional[int] = None
     if dob_allowed:
-        dob, dob_year = _extract_dob_with_year(stripped)
+        parsed_dob, _verbatim = _extract_dob_date(stripped)
+        if parsed_dob is not None:
+            # Stored DOBs are always normalized to DD-MMM-YYYY (27-May-2000).
+            dob = format_report_date(parsed_dob)
+            dob_year = parsed_dob.year
+        else:
+            # Year-only forms ("born 1990") cannot be normalized without a day
+            # and month; the verbatim value is kept so nothing is invented.
+            dob, dob_year = _extract_dob_with_year(stripped)
     if dob is not None and age is not None and _dob_conflicts_with_age(dob_year, age):
         record("dob_age_conflict", {"dob": dob, "age": age})
     elif dob is not None:
         record("patient_age", dob)
     elif age is not None:
-        record("patient_age", age)
+        if not (
+            allow_bare_dob
+            and _age_rejected_for_dob_question(stripped)
+        ):
+            record("patient_age", age)
 
     if _ONSET.search(lowered) and not _DIGITS.search(stripped):
         record("onset_date", stripped)
@@ -1129,16 +1399,21 @@ def _parse_for_pending_field(field_key: str, text: str) -> Dict[str, Any]:
     if _CLARIFY_REPLY.search(stripped):
         return {}
 
-    if field_key in ("contact_phone or contact_email", "contact_phone", "contact_email"):
+    if field_key in (
+        "contact_phone or contact_email",
+        "contact_phone",
+        "reporter_contact_phone",
+        "contact_email",
+    ):
         email = _normalize_spoken_email(stripped)
         spoken_phone = _extract_spoken_phone(stripped)
         digits = "".join(_DIGITS.findall(stripped))
         if field_key == "contact_email":
             return {"contact_email": email} if email else {}
-        if field_key == "contact_phone":
+        if field_key in ("contact_phone", "reporter_contact_phone"):
             if len(digits) >= _MIN_PHONE_DIGITS:
-                return {"contact_phone": digits}
-            return {"contact_phone": spoken_phone} if spoken_phone else {}
+                return {field_key: digits}
+            return {field_key: spoken_phone} if spoken_phone else {}
         if email:
             return {"contact_email": email}
         if len(digits) >= _MIN_PHONE_DIGITS:
@@ -1183,6 +1458,10 @@ def _parse_for_pending_field(field_key: str, text: str) -> Dict[str, Any]:
             return {"reporter_role": "self"}
         return {}
     if field_key == "patient_age":
+        # A bare 3+ digit answer while the date of birth is pending is a
+        # mis-heard date fragment (e.g. "117"), never an age.
+        if _age_rejected_for_dob_question(stripped):
+            return {}
         age = _extract_age(stripped)
         if age is None:
             # Hindi number words: cued ("पच्चीस साल है") or bare ("पच्चीस"),
@@ -1284,6 +1563,15 @@ def _parse_for_pending_field(field_key: str, text: str) -> Dict[str, Any]:
             return {}
         if field_key in ("patient_identifier", "reporter_name"):
             cleaned = _clean_name_value(stripped)
+            # A combined answer (name + date of birth) never stores the date
+            # as part of the name, and an introductory phrase such as "and my
+            # date of birth is" is never part of the name either.
+            dob_value, _year = _extract_dob_with_year(stripped)
+            if dob_value:
+                if cleaned == dob_value.strip():
+                    return {}
+                cleaned = cleaned.replace(dob_value, "").strip(" ,;-&")
+            cleaned = _DOB_NAME_LEAD.sub("", cleaned).strip(" ,;-&")
             return {field_key: cleaned} if cleaned else {}
         return {field_key: stripped}
     return {}
@@ -1328,8 +1616,18 @@ class AnswerLLMProvider:
         pending = context.get("next_field")
         fields = _parse_answer(
             message,
-            allow_bare_dob=bool(pending) and pending[0] == "patient_age",
+            allow_bare_dob=bool(pending)
+            and pending[0] in ("patient_age", "patient_identifier"),
         )
+        # A number spoken while the reporter's own contact number is the
+        # pending question is the reporter's, never the patient's: the two
+        # identities stay separate on the report.
+        if (
+            pending
+            and pending[0] == "reporter_contact_phone"
+            and fields.get("contact_phone")
+        ):
+            fields["reporter_contact_phone"] = fields.pop("contact_phone")
 
         # A fresh first report may not match the base provider's fixed phrases
         # (e.g. a misheard product name). Extract product + description so the
@@ -1341,6 +1639,19 @@ class AnswerLLMProvider:
         if not fields:
             if pending:
                 fields = _parse_for_pending_field(pending[0], message)
+        elif (
+            pending
+            and pending[0] == "patient_identifier"
+            and "adverse_event" not in fields
+            and "product" not in fields
+        ):
+            # The name-and-date-of-birth question may be answered with both
+            # values at once: the parser above captured the date, so the name
+            # is filled in from the same answer (never the other way round).
+            for key, value in _parse_for_pending_field(
+                "patient_identifier", message
+            ).items():
+                fields.setdefault(key, value)
 
         # An existing medical-care "yes" is never downgraded to "no"/"unknown"
         # by a later answer unless the reporter explicitly corrects it.

@@ -7,6 +7,7 @@ errors to HTTP status codes (mirroring ``app.main``'s round-trip endpoint).
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import tempfile
@@ -15,6 +16,7 @@ from pathlib import Path
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
 
+from app.config import get_gnani_api_key
 from app.providers import (
     AnswerLLMProvider,
     FallbackLLMProvider,
@@ -30,7 +32,7 @@ from app.language import (
 from app.session import SessionStore
 from app.workflow.service.conversational import (
     ConversationalAEWorkflow,
-    NAME_CONFIRMATION_FIELDS,
+    VOICE_CONFIRMATION_FIELDS,
 )
 from app.mi.guardrails import MIGHybridService
 from app.routing import route_transcript
@@ -46,6 +48,17 @@ router = APIRouter()
 session_store = SessionStore()
 
 MI_INTENT = "product_info"
+
+# Operator-side diagnostics only: never logs the API key, and any accidental
+# occurrence of the configured key in an upstream message is masked.
+logger = logging.getLogger(__name__)
+
+
+def _safe_detail(text: str) -> str:
+    key = get_gnani_api_key()
+    if key:
+        text = text.replace(key, "***")
+    return text
 
 
 def get_llm_provider():
@@ -88,6 +101,10 @@ def _upstream_to_http_error(exc: Exception) -> HTTPException:
     status = getattr(exc, "status_code", None)
     hint = getattr(exc, "hint", None)
     if status == 403:
+        logger.warning(
+            "Gnani STT rejected the request (HTTP 403): %s",
+            _safe_detail(hint or "check the API key and the account's credits"),
+        )
         return HTTPException(
             status_code=500,
             detail=hint
@@ -149,9 +166,86 @@ def _synthesize_or_raise(synthesize, *args, **kwargs):
             status_code=500, detail=f"MedVaani services are not configured: {exc}"
         ) from exc
     except UPSTREAM_ERRORS as exc:
+        logger.warning(
+            "Gnani TTS request failed (%s): %s",
+            type(exc).__name__,
+            _safe_detail(str(exc)),
+        )
         raise HTTPException(
             status_code=502, detail=f"Gnani service failure: {exc}"
         ) from exc
+
+
+def _empty_transcript_response(session, session_id: str, language: str, synthesize=None):
+    """Retry envelope for an empty STT transcript: missing input, not an answer.
+
+    Nothing is applied to the case and the workflow state is untouched; the
+    pending question (e.g. the email address) is simply re-asked. Spoken
+    feedback is best-effort: a TTS failure never turns the retry into an
+    error response.
+    """
+    engine = session.ae_engine
+    # The workflow's active conversational step (e.g. the pending email
+    # question) takes precedence over the engine's plain missing fields.
+    workflow = session.context.get("ae_workflow")
+    pending = workflow._active_step() if workflow is not None else None
+    if pending is None:
+        pending = engine.next_field()
+    if pending is not None and pending[0] == "contact_email":
+        retry_text = "I couldn't catch the email address. Could you please repeat it?"
+    else:
+        retry_text = "Sorry, I couldn't catch that. Could you please repeat it?"
+
+    conversation_language = (
+        normalize_language(session.context.get("conversation_language"))
+        or normalize_language(language)
+        or DEFAULT_LANGUAGE
+    )
+    spoken = translate(retry_text, conversation_language)
+    voice = voice_for(spoken.language) if spoken.translated else None
+    audio_path = None
+    if synthesize is not None:
+        try:
+            audio_path = _synthesize_or_raise(
+                synthesize, spoken.text, "ae", session_id, spoken.language, voice=voice
+            )
+        except HTTPException:
+            audio_path = None  # best-effort spoken feedback only
+
+    return JSONResponse(
+        {
+            "session_id": session_id,
+            "transcript": "",
+            "intent": "unknown",
+            "workflow": "ae",
+            "reason": "empty_transcript",
+            "response_text": retry_text,
+            "audio_path": str(audio_path) if audio_path is not None else None,
+            "current_state": engine.current_state.value,
+            "case_id": engine.case.case_id,
+            "priority": engine.case.priority,
+            "human_review_required": engine.current_state.value == "HUMAN_REVIEW",
+            "completed": engine.current_state.value == "CASE_COMPLETED",
+            "missing_information": list(engine.missing_information()),
+            "next_question": list(pending) if pending else None,
+            "safety_status": "ok",
+            "mi": None,
+            "ae": {
+                "extracted_information": {},
+                "collected_information": session.context.get("ae_workflow")
+                ._collected_snapshot()
+                if session.context.get("ae_workflow")
+                else {},
+            },
+            **_language_metadata(
+                conversation_language,
+                spoken.text if audio_path is not None else None,
+                voice,
+                spoken.translated,
+                "session" if session.context.get("conversation_language") else "default",
+            ),
+        }
+    )
 
 
 def process_transcript_turn(
@@ -251,15 +345,15 @@ def process_transcript_turn(
 
     # AE workflow. Cache one orchestrator per session so cross-turn state
     # (e.g. the one-time physician-consultation warning) persists across
-    # separate HTTP requests instead of resetting every turn. The patient name
-    # is read back for explicit confirmation; session state (including a
-    # pending confirmation) lives on session.ae_engine.
+    # separate HTTP requests instead of resetting every turn. Identity and
+    # contact values are read back for explicit confirmation; session state
+    # (including a pending confirmation) lives on session.ae_engine.
     wf = session.context.get("ae_workflow")
     if wf is None:
         wf = ConversationalAEWorkflow(
             engine,
             get_llm(),
-            confirm_fields=NAME_CONFIRMATION_FIELDS,
+            confirm_fields=VOICE_CONFIRMATION_FIELDS,
             ask_additional_information=ask_additional_information,
         )
         session.context["ae_workflow"] = wf
@@ -393,6 +487,14 @@ def create_voice_conversation_router(
                     status_code=500, detail=f"MedVaani services are not configured: {exc}"
                 ) from exc
             except UPSTREAM_ERRORS as exc:
+                if getattr(exc, "status_code", None) == 200 and (
+                    "empty transcript" in str(exc).lower()
+                ):
+                    # An empty transcript is missing input, never an answer:
+                    # nothing is applied and the pending question is re-asked.
+                    return _empty_transcript_response(
+                        session, session_id, language, synthesize=_synthesize
+                    )
                 raise _upstream_to_http_error(exc) from exc
 
             # Shared turn handling (routing, safety envelope, workflows) also

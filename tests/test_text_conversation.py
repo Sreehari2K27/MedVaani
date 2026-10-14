@@ -79,11 +79,17 @@ def test_text_turns_share_session_state_like_voice():
         "/text/conversation",
         data={"session_id": "t-ae-2", "message": "I took Lantus and have a headache."},
     ).json()
+    # Step 4: the recorded medication is verified before Step 5.
+    verified = client.post(
+        "/text/conversation",
+        data={"session_id": "t-ae-2", "message": "yes"},
+    ).json()
     second = client.post(
         "/text/conversation",
         data={"session_id": "t-ae-2", "message": "myself"},
     ).json()
 
+    assert verified["next_question"][0] == "reporter_role"
     assert second["case_id"] == first["case_id"]
     assert second["ae"]["collected_information"]["reporter_role"] == "self"
     assert "reporter_role" not in (second["missing_information"] or [])
@@ -104,19 +110,26 @@ def test_text_consent_flow_uses_same_confirmation_and_consent_rules():
         return resp.json()
 
     turn("I took Lantus and have a headache.")  # product + event captured
+    turn("yes")  # Step 4: medication verified
     turn("myself")  # reporter is the patient
 
-    named = turn("Demo Patient")  # name is read back before it is committed
-    assert "I heard Demo Patient" in named["response_text"]
+    named = turn("Demo Patient")  # name held for the combined read-back
+    assert named["ae"]["collected_information"]["patient_identifier"] is None
 
-    confirmed = turn("yes")
+    aged = turn("27/05/2000")  # date of birth completes the details
+    assert "I have your details as Demo Patient, 27-May-2000." in (
+        aged["response_text"]
+    )
+
+    confirmed = turn("yes")  # Step 6B.2: patient details confirmed
     assert (
         confirmed["ae"]["collected_information"]["patient_identifier"]
         == "Demo Patient"
     )
 
-    turn("45")  # age
-    consented = turn("yes")  # consent to contact
+    turn("9999990000")  # patient contact number (before consent)
+    turn("yes")  # contact number confirmed
+    consented = turn("yes")  # Step 7 consent to contact
     assert consented["ae"]["collected_information"]["consent_to_contact"] is True
 
 

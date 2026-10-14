@@ -34,6 +34,7 @@ STRING_FIELDS: frozenset[str] = frozenset(
         "patient_identifier",
         "patient_age",
         "reporter_name",
+        "reporter_contact_phone",
         "contact_phone",
         "contact_email",
         "dose_and_use",

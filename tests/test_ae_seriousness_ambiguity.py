@@ -115,16 +115,21 @@ def test_first_ambiguous_answer_asks_one_concise_clarification():
     assert engine.current_state is not WorkflowState.HUMAN_REVIEW
 
 
-def test_clear_answer_after_clarification_still_advances():
+def test_clear_yes_after_clarification_triggers_urgent_handling():
     engine, workflow = _workflow_at_seriousness("AE-ser-ambig-2")
     workflow.process_turn(AMBIGUOUS)
 
     result = workflow.process_turn("Yes, it is serious")
 
+    # A clear "severe or life-threatening: yes" answer is the approved urgent
+    # branch: safety first, routine questions stop, the case is escalated.
     assert engine.case.seriousness == "yes"
-    assert result.next_question is not None
-    assert result.next_question[0] == "outcome"
-    assert result.human_review_required is False
+    assert engine.case.priority == "high"
+    assert engine.current_state is WorkflowState.HUMAN_REVIEW
+    assert result.next_question is None
+    assert result.human_review_required is True
+    assert result.safety_status == "urgent_life_threatening"
+    assert "immediate medical attention" in result.response_text.lower()
 
 
 def test_second_ambiguous_answer_records_unknown_and_flags_review():
@@ -177,4 +182,10 @@ def test_journey_seriousness_phrase_is_still_no():
     workflow.process_turn(JOURNEY_SERIOUSNESS)
 
     assert engine.case.seriousness == "no"
-    assert engine.current_state is WorkflowState.SERIOUSNESS_SCREENED
+    # Severity and the pre-supplied incident date are both satisfied under the
+    # approved order; the outcome is no longer an interview question, so the
+    # report is review-ready and the negated "not life-threatening" phrasing
+    # never escalates the case.
+    assert engine.missing_information() == []
+    assert engine.can_complete() is True
+    assert engine.case.priority == "normal"

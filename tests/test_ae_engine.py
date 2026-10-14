@@ -23,10 +23,10 @@ REQUIRED_FIRST_FIELDS = {
     "patient_identifier",
     "patient_age",
     "reporter_role",
+    "contact_phone",
     "consent_to_contact",
     "onset_date",
     "seriousness",
-    "outcome",
 }
 
 
@@ -41,10 +41,13 @@ def interview_patient(engine: AEStateEngine) -> AEStateEngine:
     engine.update("patient_identifier", "PT-101d")
     engine.update("patient_age", "45")
     engine.update("reporter_role", "self")
+    # The patient contact number is a required interview answer and is
+    # collected before consent (approved workflow order).
+    engine.update("contact_phone", "9999990000")
     engine.update("contact_email", "demo.patient@example.com")
     engine.update("consent_to_contact", True)
-    engine.update("onset_date", "2026-09-30")
     engine.update("seriousness", "no")
+    engine.update("onset_date", "2026-09-30")
     engine.update("outcome", "recovering")
     return engine
 
@@ -59,15 +62,17 @@ def test_new_case_starts_in_created_state() -> None:
 def test_normal_progression_to_completion() -> None:
     engine = make_engine()
 
-    engine.update("product", "Lantus (fictional)")
-    assert engine.current_state is WorkflowState.PRODUCT_IDENTIFIED
-
+    # Approved order: the event description is captured first, then the
+    # medication (which the conversation verifies before it continues).
     engine.update("adverse_event", "Headache with blurred vision (demo)")
     assert engine.current_state is WorkflowState.EVENT_IDENTIFIED
 
+    engine.update("product", "Lantus (fictional)")
+    assert engine.current_state is WorkflowState.PRODUCT_IDENTIFIED
+
     # Reporter identity is established before patient-specific questions.
     engine.update("reporter_role", "self")
-    assert engine.current_state is WorkflowState.EVENT_IDENTIFIED
+    assert engine.current_state is WorkflowState.PRODUCT_IDENTIFIED
 
     engine.update("patient_identifier", "PT-101d")
     assert engine.current_state is WorkflowState.REPORTER_IDENTIFIED
@@ -75,26 +80,28 @@ def test_normal_progression_to_completion() -> None:
     engine.update("patient_age", "45")
     assert engine.current_state is WorkflowState.PATIENT_IDENTIFIED
 
-    # Consent is captured before any contact detail is requested.
+    # The patient contact number is collected before consent is asked.
+    engine.update("contact_phone", "9999990000")
+    assert engine.current_state is WorkflowState.CONTACT_CAPTURED
+
     engine.update("consent_to_contact", True)
     assert engine.current_state is WorkflowState.CONSENT_CAPTURED
 
-    engine.update("contact_email", "demo.patient@example.com")
-    assert engine.current_state is WorkflowState.CONTACT_CAPTURED
-
-    engine.update("onset_date", "2026-09-30")
-    assert engine.current_state is WorkflowState.EVENT_TIMING_CAPTURED
-
+    # Severity assessment precedes the incident date.
     engine.update("seriousness", "no")
     assert engine.current_state is WorkflowState.SERIOUSNESS_SCREENED
 
-    engine.update("outcome", "recovering")
-    # OUTCOME_CAPTURED -> OPTIONAL_DETAILS -> CASE_REVIEW are traversed in one
-    # auto-advance because nothing is required between outcome and review.
+    engine.update("onset_date", "2026-09-30")
+    # The outcome is no longer an interview question: the report is
+    # review-ready as soon as the applicable information is collected.
     assert engine.current_state is WorkflowState.CASE_REVIEW
     assert engine.missing_information() == []
     assert engine.next_field() is None
     assert engine.can_complete() is True
+
+    # A volunteered outcome is still accepted and stored, never required.
+    engine.update("outcome", "recovering")
+    assert engine.case.outcome == "recovering"
 
     engine.complete()
     assert engine.current_state is WorkflowState.CASE_COMPLETED
@@ -106,7 +113,8 @@ def test_missing_required_information_at_creation() -> None:
     missing = set(engine.missing_information())
     assert missing == REQUIRED_FIRST_FIELDS
     field, question = engine.next_field()  # type: ignore[misc]
-    assert field == "product"
+    # The approved flow asks for the event description first (Step 2).
+    assert field == "adverse_event"
     assert question
 
 
@@ -133,9 +141,10 @@ def test_reporter_is_the_patient() -> None:
     assert engine.case.reporter_name is None
 
     engine.update("consent_to_contact", True)
+    engine.update("contact_phone", "9999990000")
     engine.update("contact_email", "demo.patient@example.com")
-    engine.update("onset_date", "2026-09-30")
     engine.update("seriousness", "no")
+    engine.update("onset_date", "2026-09-30")
     engine.update("outcome", "recovering")
     assert engine.can_complete() is True
 
@@ -150,17 +159,23 @@ def test_reporter_is_someone_else_requires_name() -> None:
     engine.update("reporter_role", "someone_else")
     # The reporter is not fully identified until a name is captured, and the
     # reporter precedes patient identification, so the workflow has not yet
-    # advanced past EVENT_IDENTIFIED.
-    assert engine.current_state is WorkflowState.EVENT_IDENTIFIED
+    # advanced past the medication (approved order reports PRODUCT_IDENTIFIED
+    # once the event and medication are captured).
+    assert engine.current_state is WorkflowState.PRODUCT_IDENTIFIED
     assert "reporter_name" in engine.missing_information()
     assert engine.to_dict()["reporter"]["same_as_patient"] is False
     field, _ = engine.next_field()  # type: ignore[misc]
     assert field == "reporter_name"
 
     engine.update("reporter_name", "Dr. Demo Observer")
-    assert engine.current_state is WorkflowState.PATIENT_IDENTIFIED
+    # The reporter branch also collects the reporter's own contact number
+    # (approved Step 6A.3), so identity is complete only after both.
     assert "reporter_name" not in engine.missing_information()
     assert engine.case.reporter_name == "Dr. Demo Observer"
+    assert engine.current_state is WorkflowState.PRODUCT_IDENTIFIED
+
+    engine.update("reporter_contact_phone", "9999990001")
+    assert engine.current_state is WorkflowState.PATIENT_IDENTIFIED
 
 
 def test_switching_reporter_to_self_clears_duplicate_name() -> None:
@@ -197,12 +212,14 @@ def test_incomplete_case_cannot_complete() -> None:
         engine.complete()
     assert engine.current_state is not WorkflowState.CASE_COMPLETED
 
-    missing_outcome = interview_patient(make_engine())
-    missing_outcome.case.outcome = None
-    assert missing_outcome.can_complete() is False
+    incomplete = interview_patient(make_engine())
+    # An unanswered required screen still blocks completion (the outcome is
+    # no longer required, so seriousness is used here).
+    incomplete.case.seriousness = "unknown"
+    assert incomplete.can_complete() is False
     with pytest.raises(AECaseIncompleteError):
-        missing_outcome.complete()
-    assert missing_outcome.current_state is not WorkflowState.CASE_COMPLETED
+        incomplete.complete()
+    assert incomplete.current_state is not WorkflowState.CASE_COMPLETED
 
 
 def test_seriousness_supports_unknown_until_captured() -> None:

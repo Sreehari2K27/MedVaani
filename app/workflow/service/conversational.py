@@ -12,11 +12,16 @@ from typing import Any, Dict, List, Optional
 from app.providers.base import LLMProvider, LLMResult
 from app.providers.answer import (
     _AFFIRM,
+    _EXPLICIT_CORRECTION,
     _NEGATION,
     _NON_ANSWER,
     _SIMPLE_YESNO,
     _UNKNOWN_ANSWER,
+    _known_other_medicine,
+    _normalize_product,
+    _normalize_spoken_email,
     _seriousness_value,
+    normalized_dob_in,
 )
 from app.safety import SafetyLayer, SafetyResult, SafetySignal
 from app.workflow.onset import (
@@ -29,6 +34,7 @@ from app.workflow.ae_engine import (
     AEStateEngine,
     WorkflowState,
     _classify_confirmation_reply as _exact_reply_verdict,
+    _question_for,
 )
 
 
@@ -66,6 +72,7 @@ def _field_map_from_llm(llm_result: LLMResult) -> Dict[str, Any]:
         "patient_age",
         "reporter_role",
         "reporter_name",
+        "reporter_contact_phone",
         "contact_phone",
         "contact_email",
         "preferred_contact_method",
@@ -105,17 +112,138 @@ CONFIRMATION_FIELDS = frozenset(
 # explicit set) to the workflow constructor.
 NAME_CONFIRMATION_FIELDS = frozenset({"patient_identifier"})
 
+# The voice/text conversation's confirmation scope: every identity and
+# contact value the documented flow reads back (reporter name and number,
+# patient details, patient contact number, email address). The date of birth
+# is read back together with the patient name, so it is not confirmed alone.
+VOICE_CONFIRMATION_FIELDS = frozenset(
+    {
+        "patient_identifier",
+        "reporter_name",
+        "reporter_contact_phone",
+        "contact_phone",
+        "contact_email",
+    }
+)
+
 _CONFIRM_FIELD_LABELS = {
     "patient_identifier": "name",
+    "reporter_name": "name",
     "contact_phone": "phone number",
+    "reporter_contact_phone": "contact number",
     "contact_email": "email address",
 }
+
+# ---- documented AE voice conversation steps ---------------------------------
+# The wording below is fixed by the flow specification: it is spoken (and
+# displayed) verbatim, so it is never assembled or paraphrased elsewhere.
+
+# Step 1 - fixed introductory message + Step 2 invitation, shown once per
+# session and never repeated after the person has described the event.
+INTRODUCTION_MESSAGE = (
+    "Thank you for taking the time to speak with us. "
+    "I'm here to help record the event for review. "
+    "I'm not a substitute for a healthcare professional, and I can't provide "
+    "medical advice. Please tell me what happened, in your own words."
+)
+
+# Step 2 - invite the person to describe the event (also the adverse-event
+# question, so the invitation is asked whenever no description exists yet).
+EVENT_DESCRIPTION_QUESTION = (
+    "Please tell me what happened, in your own words. "
+    "Take your time\u2014I'm listening."
+)
+
+# Step 3 - one-time empathy offered with the medication question.
+MEDICATION_EMPATHY = "I'm sorry to hear that you've experienced this."
+
+# Shown after a combined name/date-of-birth read-back is rejected: only the
+# incorrect field is asked for again, never the whole question.
+DETAILS_CORRECTION_QUESTION = (
+    "Was it the name or the date of birth that was incorrect?"
+)
+DETAILS_CORRECTION_CLARIFICATION = (
+    "Sorry, please tell me the name or the date of birth that was incorrect."
+)
+
+# The person chose the date of birth to correct but did not supply a full
+# date: ask only for the missing date, never restarting the whole question.
+INCOMPLETE_DOB_CLARIFICATION = "Sorry, please tell me a full date of birth."
+
+# Field-choice phrases on the details-correction turn ("date of birth",
+# "the date", "the name"). A value that actually parses as a date is handled
+# as a corrected date before these are consulted.
+_DOB_CHOICE = re.compile(
+    r"(?i)\b(?:date\s+of\s+birth|birth\s+date|dob|birth|the\s+date|date)\b"
+)
+_NAME_CHOICE = re.compile(r"(?i)\b(?:the\s+)?name\b")
+
+# A reply that says the captured email is wrong without supplying a new
+# address ("the email address is incorrect").
+_EMAIL_INCORRECTION = re.compile(
+    r"(?i)\b(?:incorrect|wrong|not\s+right|isn'?t\s+right|isn'?t\s+correct|"
+    r"not\s+correct|not\s+my\s+address)\b"
+)
+
+# A later statement that carries an explicit correction cue could be a
+# correction of the original event description rather than another symptom;
+# it is clarified once instead of being silently combined with the original.
+EVENT_CORRECTION_CLARIFICATION = (
+    "Just to check - was that another symptom, or a correction to what you "
+    "described?"
+)
+
+# Step 4 - verify the medication before the interview continues.
+SCOPE_VERIFICATION_QUESTION = (
+    "Just to make sure I have the right medication, is it Lantus SoloStar?"
+)
+
+# Step 7 - explicit consent to contact the patient about the report.
+CONSENT_QUESTION = (
+    "Would it be okay for the appropriate team to contact the patient about "
+    "this report if any follow-up is needed?"
+)
+
+# Step 8 - the email question is conditional on consent; the offer is asked
+# first so a "no" skips email collection entirely.
+EMAIL_OFFER_QUESTION = (
+    "May I have the patient's email address, if available?"
+)
+EMAIL_REQUEST_QUESTION = (
+    "Could you please spell out your email address, one letter or number at a "
+    "time? You can say 'at the rate' for @ and 'dot' for a period."
+)
+
+# Step 9 - severity / life-threatening screen.
+SEVERITY_QUESTION = "Would you say that the event was severe or life-threatening?"
+
+# Step 10A - urgent safety response for a severe or life-threatening answer.
+SEVERITY_URGENT_MESSAGE = (
+    "Please seek immediate medical attention now. "
+    "If you've already consented to follow-up contact, we'll arrange to "
+    "collect any additional information at a more convenient time."
+)
+
+# Step 12 - closing message; the consent sentence is only added when contact
+# consent was not declined (never implying consent that was refused).
+CLOSING_MESSAGE = "Thank you for sharing this information with us. We've prepared the report for review."
+CLOSING_CONSENT_SENTENCE = (
+    "If you provided consent for follow-up contact, the appropriate team may "
+    "contact you if needed."
+)
 
 # Optional closing question. Opt-in per workflow so every existing caller
 # (legacy journey harness included) keeps its current completion behaviour;
 # the production voice endpoint enables it explicitly.
 ADDITIONAL_INFORMATION_QUESTION = (
-    "Before we finish, is there anything else you'd like to share about what happened?"
+    "Is there anything else you'd like to share that may help us document "
+    "the event?"
+)
+
+# Step 10B.2 follow-up: asked only when the person says yes to the question
+# above, so the free-text answer itself is never mistaken for "yes".
+ADDITIONAL_INFORMATION_FOLLOWUP = (
+    "Of course. Please tell me any additional details you'd like included."
 )
 
 # "No", "No, nothing else.", "No thanks", "Nothing more", "That's all" ...
@@ -140,6 +268,25 @@ def _is_decline(message: str) -> bool:
     return bool(_UNKNOWN_ANSWER.search(stripped))
 
 
+def _is_plain_yes(message: str) -> bool:
+    """Whether a reply is only an agreement, carrying no new information.
+
+    "Yes" / "yes, that's right" invite the details; "Yes, I also felt dizzy"
+    already carries them and is recorded instead of being turned into a
+    second question.
+    """
+    stripped = (message or "").strip()
+    if not stripped:
+        return False
+    verdict, _ = _classify_confirmation_turn(stripped)
+    if verdict != "yes":
+        return False
+    remainder = _AFFIRM_LEAD.sub("", stripped, count=1).strip(" .,!?")
+    if not remainder:
+        return True
+    return bool(_AFFIRM_CONTINUATION.match(remainder))
+
+
 # A reply asking us to repeat/clarify rather than confirming or correcting.
 # Hindi / Romanized-Hindi equivalents ("dobara" = again, "samajh nahi aaya" =
 # didn't understand, "kya" = what).
@@ -158,7 +305,7 @@ _NEGATION_LEAD = re.compile(
 
 # Leading filler before the actual value: "My name is Beta Jones".
 _VALUE_LEAD = re.compile(
-    r"(?i)^(?:my\s+name\s+is|name\s+is|this\s+is|it'?s|i\s*'?m|i\s+am)\s+"
+    r"(?i)^(?:my\s+name\s+is|name\s+is|this\s+is|it(?:'s|\s+is)|i\s*'?m|i\s+am)\s+"
 )
 
 # Hindi name wrappers, stripped by ``_clean_correction`` so a fuller
@@ -180,8 +327,8 @@ _AFFIRM_LEAD = re.compile(
 # ("yes it is", "yes I am sure that's right").
 _AFFIRM_CONTINUATION = re.compile(
     r"(?i)^\s*(?:i\s*'?m|i\s+am|it(?:'s|\s+is)|that(?:'s|\s+is)|we(?:'re|\s+are)"
-    r"|you(?:'re|\s+are)|isn'?t|indeed|thanks?|thank\s+you|please"
-    r"|correct|right|fine|ok|okay|sure|true)\b"
+    r"|you(?:'re|\s+are)|you\s+got\s+it|got\s+it|isn'?t|indeed|thanks?|thank\s+you"
+    r"|please|correct|right|fine|ok|okay|sure|true)\b"
 )
 
 
@@ -250,14 +397,30 @@ def _looks_like_value(text: str) -> bool:
     return True
 
 
-def _classify_confirmation_turn(message: str) -> tuple[str, str]:
+def _looks_like_contact_number(text: str) -> bool:
+    """Whether a reply plausibly is a corrected contact number.
+
+    A number is digits and dialling punctuation only; the letters rule that
+    protects name read-backs never applies to it.
+    """
+    candidate = (text or "").strip()
+    if not re.fullmatch(r"[\d\s\-().+]{7,}", candidate):
+        return False
+    return len(re.sub(r"\D", "", candidate)) >= 7
+
+
+def _classify_confirmation_turn(
+    message: str, field: Optional[str] = None
+) -> tuple[str, str]:
     """Classify a reply to a pending read-back.
 
     Returns ``(verdict, payload)`` where verdict is one of ``"yes"``,
     ``"no"``, ``"correction"`` or ``"ambiguous"`` and payload is what to
     feed to ``respond_to_confirmation`` (canonical yes/no or the corrected
     text). Ambiguous replies must not advance the workflow; the caller
-    clarifies instead.
+    clarifies instead. ``field`` is the pending field, so a contact number
+    offered as a correction is read as digits rather than as an unclear
+    reply.
     """
     stripped = (message or "").strip()
     if not stripped:
@@ -273,6 +436,17 @@ def _classify_confirmation_turn(message: str) -> tuple[str, str]:
         or _CLARIFY_PHRASE.search(stripped)
     ):
         return "ambiguous", ""
+
+    def _is_value_correction(candidate: str) -> bool:
+        if not candidate:
+            return False
+        if _looks_like_value(candidate):
+            return True
+        return field in (
+            "contact_phone",
+            "reporter_contact_phone",
+        ) and _looks_like_contact_number(candidate)
+
     lead = _NEGATION_LEAD.match(stripped)
     if lead:
         candidate = _clean_correction(lead.group(1))
@@ -280,7 +454,7 @@ def _classify_confirmation_turn(message: str) -> tuple[str, str]:
         # nahi") is a clear rejection, not a corrected value.
         if candidate and _NEGATION.search(candidate) and not _AFFIRM.search(candidate):
             return "no", "no"
-        if _looks_like_value(candidate):
+        if _is_value_correction(candidate):
             return "correction", candidate
         return "no", "no"
     affirm = bool(_AFFIRM.search(stripped))
@@ -296,7 +470,7 @@ def _classify_confirmation_turn(message: str) -> tuple[str, str]:
     if affirm and negate:
         return "ambiguous", ""
     candidate = _clean_correction(stripped)
-    if _looks_like_value(candidate):
+    if _is_value_correction(candidate):
         return "correction", candidate
     return "ambiguous", ""
 
@@ -322,6 +496,7 @@ _FIELD_CLARIFICATIONS: Dict[str, str] = {
     "consent_to_contact": "Would it be alright if we contact you later - yes or no?",
     "contact_method": "Which is easier for you - phone, email, or both?",
     "contact_phone": "Could you repeat the phone number, digit by digit?",
+    "reporter_contact_phone": "Could you repeat the contact number, digit by digit?",
     "contact_email": "Could you repeat the email address?",
     "onset_date": "About when did it start - for example today, yesterday, or a few days ago?",
     "seriousness": "Do you consider this serious - yes, no, or not sure?",
@@ -473,10 +648,157 @@ class ConversationalAEWorkflow:
         # intake for this session is over (urgent safety handling still runs
         # first on every turn). Lives on the per-session workflow instance.
         self._out_of_scope_product: Optional[str] = None
+        # Step 1: the fixed introduction is handled once per session; it is
+        # only spoken when the person has not already described the event.
+        self._introduction_shown = False
+        # Step 3: the empathy line is offered once, with the medication question.
+        self._medication_empathy_shown = False
+        # A combined name/date-of-birth read-back was rejected: only the
+        # incorrect field is asked for again.
+        self._awaiting_details_correction = False
+        # Which detail ("dob" or "name") the person chose to correct; the
+        # other field stays untouched.
+        self._correction_target: Optional[str] = None
+        # A correction-like second event description has been clarified once.
+        self._event_correction_clarified = False
+        # Step 4: pending "is it Lantus SoloStar?" verification of a captured
+        # demo product. Only a demo-product capture arms it; an out-of-scope
+        # medicine keeps the existing immediate scope/termination behaviour.
+        self._scope_verification_pending = False
+        self._product_verified = False
+        # Step 4 clarification: the recorded medication was denied without an
+        # alternative being named, so the medication question is asked again
+        # (the refuted value may be replaced by the next answer).
+        self._reask_medication = False
+        # Step 8: consent was given, so the optional email question is offered
+        # (and, on a yes, requested) exactly once.
+        self._email_offer_pending = False
+        self._email_request_pending = False
+        # Step 10B.2: a plain "yes" to the closing question asks for the
+        # details before anything is recorded as additional information.
+        self._awaiting_additional_details = False
         # First reliable conversation timestamp/timezone seen, used as a
         # fallback reference for onset normalization across turns.
         self._conversation_timestamp: Optional[Any] = None
         self._conversation_timezone: Optional[Any] = None
+
+    def _closing_message(self) -> str:
+        """Step 12 wording, honest about the actual consent answer."""
+        message = CLOSING_MESSAGE
+        if self.engine.case.consent_to_contact is False:
+            # Consent was declined: never imply that follow-up contact was
+            # consented to.
+            return message
+        return f"{message} {CLOSING_CONSENT_SENTENCE}"
+
+    def _closing_message(self) -> str:
+        """Step 12 wording, honest about the actual consent answer."""
+        message = CLOSING_MESSAGE
+        if self.engine.case.consent_to_contact is False:
+            # Consent was declined: never imply that follow-up contact was
+            # consented to.
+            return message
+        return f"{message} {CLOSING_CONSENT_SENTENCE}"
+
+    def _discard_pending_confirmation(self) -> None:
+        """Drop a pending read-back without committing it.
+
+        Used only where the value is optional (the email address): the
+        candidate is discarded, never silently retained as verified.
+        """
+        field = self.engine.case.pending_confirmation
+        if field is None:
+            return
+        self.engine.case.pending_confirmation = None
+        self.engine.case.confirmation_candidate.pop(field, None)
+        self.engine.case.confirmed_fields.discard(field)
+        self.engine.case.confirmation_response = None
+
+    def _abandon_optional_email(self) -> None:
+        """Leave the optional email unprovided and continue the interview.
+
+        The email is optional: after the retry limit the candidate is
+        discarded, the email is recorded as declined/unavailable, and the
+        next approved question is asked. Follow-up consent is never touched.
+        """
+        self._discard_pending_confirmation()
+        try:
+            self.engine.update("contact_email_declined", True)
+        except AECaseError:
+            pass
+        self._confirmation_attempts.pop("contact_email", None)
+        self._email_offer_pending = False
+        self._email_request_pending = False
+
+    def _introduction_parts(self, description_captured: bool) -> List[str]:
+        """Step 1: the fixed introduction, handled exactly once per session.
+
+        It is only spoken when the person has not already described the event:
+        a client that displayed the opening before the first utterance is
+        never given a second copy, and a first message that already IS the
+        description never has the opening repeated after it.
+        """
+        if self._introduction_shown:
+            return []
+        self._introduction_shown = True
+        if description_captured:
+            return []
+        return [INTRODUCTION_MESSAGE]
+
+    def _additional_info_due(self) -> bool:
+        """Step 10B.2 is reached once the severity screen and the incident
+        date have both been answered (never on the urgent branch)."""
+        case = self.engine.case
+        if case.seriousness not in ("yes", "no"):
+            return False
+        if not case.onset_date:
+            return False
+        return self.engine.current_state not in (
+            WorkflowState.HUMAN_REVIEW,
+            WorkflowState.CASE_COMPLETED,
+        )
+
+    def _active_step(self) -> Optional[tuple[str, str]]:
+        """The step the next turn answers, when it is not a plain field ask.
+
+        The documented flow inserts conversational steps that are not plain
+        case fields: the medication verification (Step 4), the details
+        correction after a rejected combined read-back, the optional email
+        question (Step 8) and the closing additional-information question
+        (Step 10B.2). While one is pending, it - not the engine's next
+        missing field - is the question on the table.
+        """
+        if self._correction_target is not None:
+            # Only the chosen detail is asked for again.
+            key = (
+                "patient_age"
+                if self._correction_target == "dob"
+                else "patient_identifier"
+            )
+            return key, _question_for(key, self.engine.case)
+        if self._awaiting_details_correction:
+            return "patient_identifier", DETAILS_CORRECTION_QUESTION
+        if self._reask_medication:
+            # Step 4 clarification: the recorded medication was denied, so
+            # ask for the medication name again with the existing Step 3
+            # wording. Nothing out-of-scope is claimed and nothing invented.
+            return "product", _question_for("product", self.engine.case)
+        if self._scope_verification_pending:
+            return "product_verification", SCOPE_VERIFICATION_QUESTION
+        if self._email_offer_pending:
+            return "contact_email", EMAIL_OFFER_QUESTION
+        if self._email_request_pending:
+            return "contact_email", EMAIL_REQUEST_QUESTION
+        if (
+            self._ask_additional_information
+            and self._additional_info_asked
+            and not self._additional_info_done
+        ):
+            if self._awaiting_additional_details:
+                # Step 10B.2: the person said yes; now invite the details.
+                return "additional_information", ADDITIONAL_INFORMATION_FOLLOWUP
+            return "additional_information", ADDITIONAL_INFORMATION_QUESTION
+        return None
 
     def process_turn(self, message: str, context: Optional[Dict[str, Any]] = None) -> WorkflowTurnResult:
         """Process a single conversational turn."""
@@ -492,12 +814,36 @@ class ConversationalAEWorkflow:
             or self.engine.case.adverse_event
             or self.engine.case.unclassified_initial_input
         )
+        active_step = self._active_step()
+        # A step armed by this turn's own answer is answered on the next
+        # turn: the consent answer must never be read as the email answer.
+        scope_verification_at_start = self._scope_verification_pending
+        email_offer_at_start = self._email_offer_pending
+        email_request_at_start = self._email_request_pending
+        reask_medication_at_start = self._reask_medication
+        pending_question = (
+            active_step
+            if active_step is not None
+            else (self.engine.next_field() if interview_started else None)
+        )
+        # Seriousness is only ever an answer to the severity question: a
+        # symptom description containing "serious"/"severe" must never be
+        # recorded as (or escalate to) an unasked severity answer.
+        severity_question_pending = (
+            pending_question is not None and pending_question[0] == "seriousness"
+        )
+        # Follow-up consent is only ever an answer to the consent question:
+        # an email reply (or any other turn) can never change it.
+        consent_question_pending = (
+            pending_question is not None
+            and pending_question[0] == "consent_to_contact"
+        )
         turn_context = {
             "case_state": self.engine.current_state.value,
             "case_id": self.engine.case.case_id,
             "priority": self.engine.case.priority,
             "collected": self._collected_snapshot(),
-            "next_field": self.engine.next_field() if interview_started else None,
+            "next_field": pending_question,
         }
         if context:
             turn_context.update(context)
@@ -621,17 +967,123 @@ class ConversationalAEWorkflow:
         applied_any = False
         clarification: Optional[str] = None
         confirmation_review = False
+        # Set when the Step 4 clarification received a new medication name.
+        product_replaced = False
         # Set when a suspect product other than the configured demo product
         # (Lantus SoloStar) is captured; the reply then carries the bounded
         # prototype-scope message (never a submission claim).
         product_scope_notice: Optional[str] = None
+        # Set when this turn answers Step 9 with a severe / life-threatening
+        # event: safety handling then takes over the rest of the conversation.
+        severity_urgent = False
+
+        # 4-VERIFY (Step 4). The captured medication is verified before the
+        # interview continues. "Yes" confirms it, "no" ends routine intake for
+        # the mentioned medicine using the existing out-of-scope behaviour, a
+        # restated medicine is re-checked (and canonicalised), and anything
+        # else is clarified - uncertainty is never read as confirmation.
+        scope_verification_turn = False
+        if scope_verification_at_start:
+            scope_verification_turn = True
+            verdict, payload = _classify_confirmation_turn(message, "product")
+            corrected: Optional[str] = None
+            if verdict == "correction":
+                named = (payload or "").strip()
+                canonical = _normalize_product(named) or _known_other_medicine(named)
+                negation_led = bool(_NEGATION_LEAD.match((message or "").strip()))
+                if canonical is None and not negation_led:
+                    # A value that names no medicine answers nothing here: it
+                    # is never stored as the product (the captured product is
+                    # never overwritten) and never ends the report. Clarify the
+                    # yes-or-no verification instead.
+                    verdict = "ambiguous"
+                else:
+                    corrected = canonical or named
+            if verdict == "yes":
+                self._scope_verification_pending = False
+                self._product_verified = True
+                self._confirmation_attempts.pop("product_verification", None)
+            elif verdict == "no":
+                recorded = self.engine.case.product or ""
+                if _normalize_product(recorded) is not None:
+                    # A bare "no": the recorded demo product itself was
+                    # denied and no alternative medicine was named. Nothing
+                    # out-of-scope can be described and nothing is invented,
+                    # so the medication question is asked again; the loop is
+                    # bounded by the same attempt limit as the other
+                    # confirmation loops and falls back to human review.
+                    self._scope_verification_pending = False
+                    self._reask_medication = True
+                    attempts = (
+                        self._confirmation_attempts.get("product_verification", 0)
+                        + 1
+                    )
+                    self._confirmation_attempts["product_verification"] = attempts
+                    if attempts >= _MAX_CONFIRMATION_ATTEMPTS:
+                        self.engine.flag_for_review(
+                            reason=(
+                                "The medication could not be verified after "
+                                f"{attempts} attempts. All collected information "
+                                "is preserved and the report is paused for "
+                                "qualified human review."
+                            )
+                        )
+                        confirmation_review = True
+                        clarification = None
+                        self._reask_medication = False
+                else:
+                    # The recorded medicine is not the demo product: the
+                    # existing out-of-scope termination applies unchanged.
+                    self._scope_verification_pending = False
+                    self._out_of_scope_product = (
+                        recorded or "the mentioned medication"
+                    )
+                    product_scope_notice = self._out_of_scope_product
+            elif verdict == "correction" and corrected is not None:
+                try:
+                    self.engine.update("product", corrected)
+                except AECaseError:
+                    corrected = None
+                if corrected is None:
+                    clarification = _clarification_for("product", False)
+                elif corrected == "Lantus SoloStar":
+                    self._scope_verification_pending = False
+                    self._product_verified = True
+                    self._confirmation_attempts.pop(
+                        "product_verification", None
+                    )
+                else:
+                    self._scope_verification_pending = False
+                    self._out_of_scope_product = corrected
+                    product_scope_notice = corrected
+                if clarification is None:
+                    applied_any = True
+            else:
+                attempts = (
+                    self._confirmation_attempts.get("product_verification", 0) + 1
+                )
+                self._confirmation_attempts["product_verification"] = attempts
+                if attempts >= _MAX_CONFIRMATION_ATTEMPTS:
+                    self.engine.flag_for_review(
+                        reason=(
+                            "The medication could not be verified after "
+                            f"{attempts} attempts. All collected information "
+                            "is preserved and the report is paused for "
+                            "qualified human review."
+                        )
+                    )
+                    confirmation_review = True
+                    clarification = None
+                    self._scope_verification_pending = False
+                else:
+                    clarification = _clarification_for("product", False)
 
         # 4-DOB. A single answer with both a date of birth and an age that
         # disagree by more than a year: hold both values, apply neither, and
         # ask exactly one targeted clarification (never silently choose).
         conflict_prompt: Optional[str] = None
         raw_conflict = (llm_result.extracted_fields or {}).get("dob_age_conflict")
-        if isinstance(raw_conflict, dict):
+        if isinstance(raw_conflict, dict) and not scope_verification_turn:
             conflict_dob = str(raw_conflict.get("dob") or "").strip()
             conflict_age = str(raw_conflict.get("age") or "").strip()
             if conflict_dob and conflict_age and not self.engine.case.patient_age:
@@ -641,17 +1093,194 @@ class ConversationalAEWorkflow:
         # 4a. Explicit confirmation sub-state. While a read-back is pending
         # for an integrated field, the turn is a confirmation reply (yes / no
         # / correction), not a new field answer; anything ambiguous is
-        # clarified without advancing.
+        # clarified without advancing. While the combined name read-back is
+        # still waiting for the date of birth the turn answers that question
+        # instead, so no read-back is offered before both values are known.
+        #
+        # A rejected combined read-back only asks for the field that was
+        # wrong (name or date of birth); a date repeated while the combined
+        # read-back is pending corrects the date and never the name.
         confirmation_handled = False
         confirmation_rejected = False
         pending_field = self.engine.case.pending_confirmation
-        if pending_field is not None and pending_field in self._confirm_fields:
+        awaiting_dob = (
+            pending_field == "patient_identifier"
+            and not self.engine.case.patient_age
+        )
+        details_correction_turn = self._awaiting_details_correction
+        handled_by_details_flow = False
+        confirmation_active = (
+            pending_field is not None
+            and pending_field in self._confirm_fields
+            and not awaiting_dob
+            and not scope_verification_turn
+            and not details_correction_turn
+        )
+        repeated_dob = None
+        if confirmation_active and pending_field == "patient_identifier":
+            repeated_dob = normalized_dob_in(message)
+        if self._correction_target is not None:
+            # Only the chosen detail is being corrected: a full date updates
+            # the date of birth (the name stays), a name-like value updates
+            # the name (the date stays); anything incomplete is re-asked for
+            # that one field, bounded like the other confirmation loops.
+            confirmation_handled = True
+            handled_by_details_flow = True
+            dob_value = normalized_dob_in(message)
+            verdict, payload = _classify_confirmation_turn(message, pending_field)
+            if dob_value is not None:
+                try:
+                    self.engine.update("patient_age", dob_value)
+                except AECaseError:
+                    pass
+                self._correction_target = None
+                applied_any = True
+                self._confirmation_attempts.pop("patient_identifier", None)
+            elif (
+                self._correction_target == "name"
+                and verdict == "correction"
+                and _looks_like_value(payload)
+                and len(payload.split()) >= 2
+            ):
+                try:
+                    self.engine.respond_to_confirmation(payload)
+                    self._correction_target = None
+                    applied_any = True
+                    self._confirmation_attempts.pop("patient_identifier", None)
+                except AECaseError:
+                    clarification = DETAILS_CORRECTION_CLARIFICATION
+            elif self._correction_target == "dob":
+                attempts = (
+                    self._confirmation_attempts.get("patient_identifier", 0) + 1
+                )
+                self._confirmation_attempts["patient_identifier"] = attempts
+                if attempts >= _MAX_CONFIRMATION_ATTEMPTS:
+                    self.engine.flag_for_review(
+                        reason=(
+                            "The date of birth could not be corrected after "
+                            f"{attempts} attempts. All collected information "
+                            "is preserved and the report is paused for "
+                            "qualified human review."
+                        )
+                    )
+                    confirmation_review = True
+                    clarification = None
+                    self._correction_target = None
+                else:
+                    clarification = INCOMPLETE_DOB_CLARIFICATION
+            else:
+                # Name target with no usable value: return to the choice
+                # question, which keeps its own attempt bound.
+                self._correction_target = None
+                clarification = DETAILS_CORRECTION_CLARIFICATION
+        elif details_correction_turn:
+            confirmation_handled = True  # this turn consumes the reply only
+            handled_by_details_flow = True
+            dob_value = normalized_dob_in(message)
+            verdict, payload = _classify_confirmation_turn(message, pending_field)
+            if dob_value is not None:
+                # Only the date of birth is corrected; the name is retained.
+                try:
+                    self.engine.update("patient_age", dob_value)
+                except AECaseError:
+                    pass
+                self._awaiting_details_correction = False
+                applied_any = True
+                self._confirmation_attempts.pop("patient_identifier", None)
+            elif _DOB_CHOICE.search(message):
+                # "date of birth" / "the date" names the field to correct;
+                # the literal phrase is never stored as a value.
+                self._correction_target = "dob"
+                self._awaiting_details_correction = False
+                applied_any = True
+            elif _NAME_CHOICE.search(message):
+                # "the name" names the field to correct; the date stays.
+                self._correction_target = "name"
+                self._awaiting_details_correction = False
+                applied_any = True
+            elif (
+                verdict == "correction"
+                and _looks_like_value(payload)
+                and len(payload.split()) >= 2
+            ):
+                # Only the name is corrected (first and last name per the
+                # question); the date of birth is retained. A single-word
+                # mumble ("hmm") is ambiguity, never a corrected name.
+                try:
+                    self.engine.respond_to_confirmation(payload)
+                    self._awaiting_details_correction = False
+                    applied_any = True
+                    self._confirmation_attempts.pop("patient_identifier", None)
+                except AECaseError:
+                    clarification = DETAILS_CORRECTION_CLARIFICATION
+            elif verdict == "no":
+                # A repeated clear rejection is a successful interpretation:
+                # the choice is simply re-asked, without counting a failed
+                # attempt (mirroring the read-back rejection semantics).
+                clarification = DETAILS_CORRECTION_CLARIFICATION
+            else:
+                attempts = (
+                    self._confirmation_attempts.get("patient_identifier", 0) + 1
+                )
+                self._confirmation_attempts["patient_identifier"] = attempts
+                if attempts >= _MAX_CONFIRMATION_ATTEMPTS:
+                    self.engine.flag_for_review(
+                        reason=(
+                            "The patient details could not be corrected after "
+                            f"{attempts} attempts. All collected information "
+                            "is preserved and the report is paused for "
+                            "qualified human review."
+                        )
+                    )
+                    confirmation_review = True
+                    clarification = None
+                    self._awaiting_details_correction = False
+                else:
+                    clarification = DETAILS_CORRECTION_CLARIFICATION
+        elif confirmation_active and repeated_dob is not None:
+            # A date of birth repeated (or corrected) while the combined
+            # read-back is pending answers the date question, never the name.
+            try:
+                self.engine.update("patient_age", repeated_dob)
+            except AECaseError:
+                pass
+            confirmation_handled = True
+            applied_any = True
+            handled_by_details_flow = True
+            self._confirmation_attempts.pop("patient_identifier", None)
+        elif confirmation_active:
             awaiting_correction = self.engine.case.confirmation_response == "no"
-            verdict, payload = _classify_confirmation_turn(message)
+            verdict, payload = _classify_confirmation_turn(message, pending_field)
+            if pending_field == "contact_email":
+                # Any reply carrying a usable address (written or spelled)
+                # is a correction/capture of the candidate - never a yes/no
+                # answer - and the normalized form is what gets confirmed.
+                normalized_email = _normalize_spoken_email(message)
+                if normalized_email:
+                    verdict, payload = "correction", normalized_email
+                elif verdict == "correction":
+                    # "the email address is incorrect" rejects the candidate
+                    # (the corrected address is then asked for); anything else
+                    # is ambiguous and is never stored as an address.
+                    if _EMAIL_INCORRECTION.search(message):
+                        verdict, payload = "no", "no"
+                    else:
+                        verdict = "ambiguous"
             if verdict == "ambiguous" or (
                 verdict == "yes" and awaiting_correction
             ):
                 clarification = _clarification_for(pending_field, awaiting_correction)
+            elif (
+                verdict == "no"
+                and pending_field == "patient_identifier"
+                and self.engine.case.patient_age
+            ):
+                # Rejecting the combined read-back does not restart the whole
+                # question: only the incorrect field is asked for again.
+                self._awaiting_details_correction = True
+                confirmation_handled = True
+                confirmation_rejected = True  # clear interpretation, not a miss
+                applied_any = True
             else:
                 try:
                     self.engine.respond_to_confirmation(payload)
@@ -673,7 +1302,7 @@ class ConversationalAEWorkflow:
         # human review (existing fallback) instead of repeating forever.
         # Nothing is discarded, no contact detail is invented, and completion
         # stays off.
-        if pending_field is not None and pending_field in self._confirm_fields:
+        if confirmation_active and not handled_by_details_flow:
             if confirmation_handled and confirmation_rejected:
                 pass
             elif confirmation_handled and self.engine.case.pending_confirmation is None:
@@ -682,32 +1311,75 @@ class ConversationalAEWorkflow:
                 attempts = self._confirmation_attempts.get(pending_field, 0) + 1
                 self._confirmation_attempts[pending_field] = attempts
                 if attempts >= _MAX_CONFIRMATION_ATTEMPTS:
-                    label = _CONFIRM_FIELD_LABELS.get(
-                        pending_field, pending_field.replace("_", " ")
-                    )
-                    self.engine.flag_for_review(
-                        reason=(
-                            f"The {label} could not be confirmed after "
-                            f"{attempts} attempts. All collected information "
-                            "is preserved and the report is paused for "
-                            "qualified human review."
+                    if pending_field == "contact_email":
+                        # The email is optional: after the retry limit it is
+                        # left unprovided and the interview continues safely
+                        # (the candidate is discarded, never kept as
+                        # verified, and consent is untouched).
+                        self._abandon_optional_email()
+                    else:
+                        label = _CONFIRM_FIELD_LABELS.get(
+                            pending_field, pending_field.replace("_", " ")
                         )
-                    )
-                    confirmation_review = True
-                    clarification = None
+                        self.engine.flag_for_review(
+                            reason=(
+                                f"The {label} could not be confirmed after "
+                                f"{attempts} attempts. All collected information "
+                                "is preserved and the report is paused for "
+                                "qualified human review."
+                            )
+                        )
+                        confirmation_review = True
+                        clarification = None
 
         # 4b. Apply each field if present (engine validates). The original
         # product and side-effect description are never overwritten once
         # captured. A confirmation reply consumes the turn, so no other field
-        # is applied on that turn.
-        if not confirmation_handled:
+        # is applied on that turn; a Step 4 medication-verification reply is
+        # handled entirely by its own branch above.
+        if not confirmation_handled and not scope_verification_turn:
             for field_name, field_value in extracted.items():
-                if field_name == "product" and self.engine.case.product:
+                if field_name == "seriousness" and not severity_question_pending:
+                    # Context-gated: seriousness is only recorded when the
+                    # severity question is the one on the table. A symptom
+                    # description (even one containing "serious" or "severe")
+                    # is never an answer to it and never triggers the urgent
+                    # branch.
+                    continue
+                if field_name == "consent_to_contact" and not consent_question_pending:
+                    # Context-gated: follow-up consent is only recorded when
+                    # the consent question is the one on the table. Saying
+                    # "no" to an email or correcting an email can never
+                    # withdraw or overwrite the consent already given.
+                    continue
+                if (
+                    field_name == "product"
+                    and self.engine.case.product
+                    and not self._reask_medication
+                ):
                     # The original product is never overwritten once captured.
                     continue
                 if field_name == "adverse_event":
                     # Never replace the original description; merge in a newly
-                    # reported symptom so every symptom is preserved.
+                    # reported symptom so every symptom is preserved. The
+                    # closing answer (Step 10B.2) is kept separately from the
+                    # original description, so it never extends it either.
+                    if collecting_additional and self.engine.case.adverse_event:
+                        continue
+                    if (
+                        self.engine.case.adverse_event
+                        and not self._event_correction_clarified
+                        and isinstance(field_value, str)
+                        and field_value.strip()
+                        and _EXPLICIT_CORRECTION.search(message)
+                    ):
+                        # A correction-like statement is clarified once instead
+                        # of being silently combined with the original. The
+                        # wording is never lost afterwards: it is merged
+                        # verbatim and the original is never overwritten.
+                        self._event_correction_clarified = True
+                        clarification = EVENT_CORRECTION_CLARIFICATION
+                        continue
                     if isinstance(field_value, str) and field_value.strip():
                         merged = _merge_event_description(
                             self.engine.case.adverse_event or "", field_value
@@ -756,6 +1428,13 @@ class ConversationalAEWorkflow:
                     else:
                         self.engine.update(field_name, field_value)
                     applied_any = True
+                    if field_name == "product":
+                        # A Step 4 clarification may replace the medication
+                        # that was denied; every later product answer keeps
+                        # the existing no-overwrite rule.
+                        if self._reask_medication:
+                            product_replaced = True
+                        self._reask_medication = False
                     if (
                         field_name == "product"
                         and isinstance(field_value, str)
@@ -768,9 +1447,150 @@ class ConversationalAEWorkflow:
                         # becomes out of scope and routine intake ends.
                         product_scope_notice = field_value
                         self._out_of_scope_product = field_value
+                    elif (
+                        field_name == "product"
+                        and field_value == "Lantus SoloStar"
+                        and not self._product_verified
+                        and not self._scope_verification_pending
+                    ):
+                        # Step 4: the demo product is verified with the person
+                        # before the interview continues.
+                        self._scope_verification_pending = True
+                    if field_name == "consent_to_contact" and field_value is True:
+                        # Step 8: consent opens the optional email question,
+                        # which is offered exactly once and may be declined.
+                        if (
+                            not self.engine.case.contact_email
+                            and not self.engine.case.contact_email_declined
+                        ):
+                            self._email_offer_pending = True
+                    if field_name == "contact_email":
+                        # The address is on the table: no further email ask.
+                        self._email_offer_pending = False
+                        self._email_request_pending = False
+                    if field_name == "seriousness" and field_value == "yes":
+                        # Step 10A: a severe or life-threatening event is
+                        # treated as urgent regardless of how it was phrased.
+                        severity_urgent = True
                 except Exception:
                     # Skip invalid fields per engine validation rules
                     pass
+
+        # 4-REASK (Step 4 clarification). A clarification turn that yields no
+        # new medication counts as one failed verification attempt, bounded
+        # exactly like the read-back loops: after the limit the report is
+        # preserved and paused for qualified human review instead of asking
+        # forever. A captured medication clears both counters.
+        if product_replaced:
+            self._confirmation_attempts.pop("product_reask", None)
+            self._confirmation_attempts.pop("product_verification", None)
+        elif self._reask_medication and reask_medication_at_start:
+            attempts = self._confirmation_attempts.get("product_reask", 0) + 1
+            self._confirmation_attempts["product_reask"] = attempts
+            if attempts >= _MAX_CONFIRMATION_ATTEMPTS:
+                self.engine.flag_for_review(
+                    reason=(
+                        "The medication could not be captured after "
+                        f"{attempts} clarification attempts. All collected "
+                        "information is preserved and the report is paused "
+                        "for qualified human review."
+                    )
+                )
+                confirmation_review = True
+                clarification = None
+                self._reask_medication = False
+
+        # 4-EMAIL (Step 8). Consent was given, so the email address is offered
+        # first: a no skips it entirely, a yes asks for the address, and an
+        # address volunteered on either turn is captured and read back by the
+        # normal confirmation path.
+        if email_offer_at_start:
+            if self.engine.case.pending_confirmation == "contact_email":
+                self._email_offer_pending = False
+            elif self.engine.case.contact_email:
+                self._email_offer_pending = False
+            elif _is_decline(message):
+                self._email_offer_pending = False
+                self.engine.update("contact_email_declined", True)
+            else:
+                verdict, _ = _classify_confirmation_turn(message)
+                if verdict == "yes":
+                    self._email_offer_pending = False
+                    self._email_request_pending = True
+                elif verdict == "no":
+                    self._email_offer_pending = False
+                    self.engine.update("contact_email_declined", True)
+                else:
+                    attempts = (
+                        self._confirmation_attempts.get("contact_email", 0) + 1
+                    )
+                    self._confirmation_attempts["contact_email"] = attempts
+                    if attempts >= _MAX_CONFIRMATION_ATTEMPTS:
+                        # Optional email: leave it unprovided and continue.
+                        try:
+                            self.engine.update("contact_email_declined", True)
+                        except AECaseError:
+                            pass
+                        self._email_offer_pending = False
+                        self._confirmation_attempts.pop("contact_email", None)
+                    else:
+                        clarification = _clarification_for("contact_email", False)
+        elif email_request_at_start:
+            if self.engine.case.pending_confirmation == "contact_email":
+                self._email_request_pending = False
+            elif self.engine.case.contact_email:
+                self._email_request_pending = False
+            elif _is_decline(message) or _classify_confirmation_turn(message)[0] == "no":
+                # The address is optional: declining it never blocks the report.
+                self._email_request_pending = False
+                self.engine.update("contact_email_declined", True)
+            else:
+                attempts = (
+                    self._confirmation_attempts.get("contact_email", 0) + 1
+                )
+                self._confirmation_attempts["contact_email"] = attempts
+                if attempts >= _MAX_CONFIRMATION_ATTEMPTS:
+                    # Optional email: leave it unprovided and continue.
+                    try:
+                        self.engine.update("contact_email_declined", True)
+                    except AECaseError:
+                        pass
+                    self._email_request_pending = False
+                    self._confirmation_attempts.pop("contact_email", None)
+                else:
+                    clarification = _short_clarification("contact_email")
+
+        # 4-URGENT (Step 10A). A severe or life-threatening answer takes
+        # priority over every routine question: the person is asked to seek
+        # immediate medical attention, the case is escalated for qualified
+        # human review (existing urgent handling), routine intake stops, and
+        # the incident date and additional-information steps are skipped.
+        if severity_urgent:
+            self.engine.mark_urgent(
+                reason=(
+                    "The reporter answered that the event was severe or "
+                    "life-threatening."
+                )
+            )
+            response_parts = self._introduction_parts(
+                description_captured=bool(self.engine.case.adverse_event)
+            )
+            response_parts.append(SEVERITY_URGENT_MESSAGE)
+            response_parts.append(self._closing_message())
+            return WorkflowTurnResult(
+                case_id=self.engine.case.case_id,
+                current_state=self.engine.current_state.value,
+                intent="urgent_medical",
+                extracted_information=extracted,
+                safety_status="urgent_life_threatening",
+                priority=self.engine.case.priority,
+                human_review_required=True,
+                collected_information=self._collected_snapshot(),
+                missing_information=[],
+                response_text=" ".join(response_parts),
+                completed=False,
+                next_question=None,
+            )
 
         # Preserve the person's initial free-text description verbatim when it
         # could not yet be classified as an adverse event (audit step 1):
@@ -804,37 +1624,74 @@ class ConversationalAEWorkflow:
 
         # 4c. Finalize once every required field is satisfied. The engine owns
         # the completion rules; this only invokes its guarded complete(). When
-        # the optional closing question is enabled it is asked exactly once
-        # after intake is otherwise complete, and the case completes on the
-        # following turn (the answer is recorded verbatim).
+        # the optional closing question is enabled it is asked exactly once at
+        # Step 10B.2 (after the severity screen and the incident date), a plain
+        # "yes" first invites the details, and the case completes once every
+        # required field is satisfied.
         ready_to_complete = (
             self.engine.can_complete()
             and self.engine.current_state is not WorkflowState.CASE_COMPLETED
         )
         additional_info_provided = False
-        if ready_to_complete:
-            if self._ask_additional_information and not self._additional_info_done:
+        if self._ask_additional_information:
+            if not self._additional_info_done and self._additional_info_due():
                 if not self._additional_info_asked:
                     self._additional_info_asked = True
-                else:
-                    if _is_decline(message):
-                        self.engine.decline_additional_information()
-                    else:
+                elif _is_decline(message):
+                    self.engine.decline_additional_information()
+                    self._additional_info_done = True
+                    self._awaiting_additional_details = False
+                elif self._awaiting_additional_details or not _is_plain_yes(message):
+                    try:
                         self.engine.record_additional_information(message)
                         additional_info_provided = True
+                    except AECaseError:
+                        pass
                     self._additional_info_done = True
-                    self.engine.complete()
-            else:
+                    self._awaiting_additional_details = False
+                else:
+                    # A bare "yes" is not the additional information itself:
+                    # ask for the details before recording anything.
+                    self._awaiting_additional_details = True
+            if self._additional_info_done and self.engine.can_complete():
                 self.engine.complete()
+        elif ready_to_complete:
+            self.engine.complete()
 
         # 5. Determine next info
         missing = self.engine.missing_information()
         next_field = self.engine.next_field()
 
+        # 5-pre. A documented conversational step (the Step 4 medication
+        # verification, the details correction after a rejected combined
+        # read-back, the Step 8 email question, or the Step 10B.2 closing
+        # question) replaces the next plain field question while it is
+        # pending. A pending read-back keeps priority: it owns its question -
+        # except while the person is choosing which detail to correct. The
+        # closing question keeps the envelope behaviour it has always
+        # had: it is asked in the response, while ``next_question`` stays
+        # null because no case field is outstanding for it.
+        active_step = None
+        if (
+            self._awaiting_details_correction
+            or self._correction_target is not None
+            or self.engine.case.pending_confirmation is None
+        ):
+            active_step = self._active_step()
+        closing_step_active = bool(
+            active_step is not None and active_step[0] == "additional_information"
+        )
+        if active_step is not None:
+            next_field = active_step
+
         # 5a. If the same field is still pending and the reply advanced nothing,
         # offer one short, differently-worded clarification rather than looping
-        # on the identical question indefinitely.
-        if next_field is not None:
+        # on the identical question indefinitely. Conversational steps above own
+        # their own clarification and bound, so the field loop never runs for
+        # them.
+        if active_step is not None:
+            pass
+        elif next_field is not None:
             field_key = next_field[0]
             if (
                 self._last_asked_field == field_key
@@ -894,8 +1751,9 @@ class ConversationalAEWorkflow:
 
         # 5b. A held DOB/age conflict asks its own single clarification this
         # turn, replacing the generic age question. Questioning pauses (e.g.
-        # under human review) keep their own behaviour.
-        if conflict_prompt is not None and next_field is not None:
+        # under human review) keep their own behaviour. A pending
+        # conversational step keeps priority over it.
+        if conflict_prompt is not None and next_field is not None and active_step is None:
             next_field = ("patient_age", conflict_prompt)
 
         # 5c. An out-of-scope suspect product ends routine intake for this
@@ -905,7 +1763,13 @@ class ConversationalAEWorkflow:
             next_field = None
 
         # 6. Build response
-        response_parts = []
+        completed = self.engine.current_state is WorkflowState.CASE_COMPLETED
+        # Step 1: the opening is handled once per session and is never spoken
+        # after the person has already described the event.
+        response_parts = self._introduction_parts(
+            description_captured=bool(self.engine.case.adverse_event)
+        )
+        opening_emitted = bool(response_parts)
         if confirmation_review:
             # Read-back attempts are exhausted: say so plainly. The case is
             # under human review (never completed) with everything preserved.
@@ -916,17 +1780,23 @@ class ConversationalAEWorkflow:
                 # engine still returns the read-back, so nothing advanced).
                 response_parts.append(clarification)
             is_ae = llm_result.intent == "ae_report" or safety_result.signal == SafetySignal.NORMAL_AE_REPORTING
+            # Step 3: the medication question carries the one-time empathy
+            # line, which replaces the generic acknowledgement on that turn so
+            # the conversation never repeats sympathy statements.
+            empathy_next = (
+                next_field is not None
+                and next_field[0] == "product"
+                and not self._medication_empathy_shown
+            )
             if additional_info_provided:
                 response_parts.append("Thank you for sharing that.")
-            elif is_ae:
+            elif is_ae and not empathy_next:
                 if not self._warning_shown:
                     response_parts.append(
                         "Thanks for telling me, and I'm sorry you're going through this. "
                         "I'll take a few details so we can record it safely."
                     )
-                    response_parts.append("Important: Please consult a qualified physician or healthcare professional for evaluation and treatment of the reported side effects. Do not self-diagnose or change your medication without medical advice.")
-                    self._warning_shown = True
-            elif applied_any and not collecting_additional:
+            elif applied_any and not collecting_additional and not completed:
                 response_parts.append(self._ACKS[self._ack_index % len(self._ACKS)])
                 self._ack_index += 1
 
@@ -939,21 +1809,29 @@ class ConversationalAEWorkflow:
 
             if next_field:
                 _, question = next_field
-                response_parts.append(question)
-            elif self.engine.current_state is WorkflowState.CASE_COMPLETED:
-                if self.engine.case.consent_to_contact is False:
-                    response_parts.append(
-                        "Thank you for sharing this information. We've recorded what "
-                        "you've provided. Since you haven't consented to follow-up "
-                        "contact, we won't contact you using these details."
-                    )
-                else:
-                    response_parts.append(
-                        "Thank you - I've recorded everything we need for now. "
-                        "A member of our team will follow up if needed. Take care."
-                    )
-            elif self._additional_info_asked and not self._additional_info_done:
-                response_parts.append(ADDITIONAL_INFORMATION_QUESTION)
+                if empathy_next:
+                    # Step 3: acknowledge the experience once, then ask.
+                    response_parts.append(MEDICATION_EMPATHY)
+                    self._medication_empathy_shown = True
+                # The opening already ends with the event-description
+                # invitation: never ask the same question twice.
+                if not (opening_emitted and next_field[0] == "adverse_event"):
+                    response_parts.append(question)
+            elif completed:
+                # Step 11/12: the report is presented by the existing report
+                # mechanism on completion; the closing line follows it.
+                response_parts.append(self._closing_message())
+
+            # The physician-consultation note follows the question instead of
+            # preceding it, so it never crowds the medication question.
+            if is_ae and not self._warning_shown:
+                response_parts.append(
+                    "Important: Please consult a qualified physician or healthcare professional for evaluation and treatment of the reported side effects."
+                )
+                response_parts.append(
+                    "Do not self-diagnose or change your medication without medical advice."
+                )
+                self._warning_shown = True
 
         response_text = " ".join(response_parts) if response_parts else "Thank you."
 
@@ -969,7 +1847,11 @@ class ConversationalAEWorkflow:
             missing_information=missing,
             response_text=response_text,
             completed=(self.engine.current_state is WorkflowState.CASE_COMPLETED),
-            next_question=list(next_field) if next_field else None,
+            next_question=(
+                None
+                if closing_step_active
+                else (list(next_field) if next_field else None)
+            ),
         )
 
     def _capture_urgent_description(self, message: str) -> None:
@@ -1019,6 +1901,7 @@ class ConversationalAEWorkflow:
                 case.patient_sex,
                 case.reporter_role,
                 case.reporter_name,
+                case.reporter_contact_phone,
                 case.contact_phone,
                 case.contact_email,
                 case.preferred_contact_method,
@@ -1045,8 +1928,10 @@ class ConversationalAEWorkflow:
             "patient_age": case.patient_age,
             "reporter_role": case.reporter_role,
             "reporter_name": case.reporter_name,
+            "reporter_contact_phone": case.reporter_contact_phone,
             "contact_phone": case.contact_phone,
             "contact_email": case.contact_email,
+            "contact_email_declined": case.contact_email_declined,
             "preferred_contact_method": case.preferred_contact_method,
             "consent_to_contact": case.consent_to_contact,
             "onset_date": case.onset_date,

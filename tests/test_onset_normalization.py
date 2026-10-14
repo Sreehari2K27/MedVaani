@@ -12,6 +12,7 @@ from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.api.voice_conversation import create_voice_conversation_router
@@ -58,6 +59,85 @@ def test_fixed_conversation_date_displays_as_dd_mmm_yyyy():
     assert format_report_date(date(2026, 10, 9)) == "09-Oct-2026"
     assert format_iso_date("2026-10-09") == "09-Oct-2026"
     assert format_report_date(date(2026, 1, 3)) == "03-Jan-2026"
+
+
+# ---- spoken-out and relative onset wording ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "statement,expected_iso,expected_display",
+    [
+        ("fourteenth of May twenty twenty six", "2026-05-14", "14-May-2026"),
+        ("the 14th of May 2026", "2026-05-14", "14-May-2026"),
+        ("14th May 2026", "2026-05-14", "14-May-2026"),
+        ("twenty seventh May two thousand", "2000-05-27", "27-May-2000"),
+        ("twenty seventh june nineteen ninety eight", "1998-06-27", "27-Jun-1998"),
+        ("May 14 2026", "2026-05-14", "14-May-2026"),
+        ("2026-05-14", "2026-05-14", "14-May-2026"),
+        ("14/05/2026", "2026-05-14", "14-May-2026"),
+    ],
+)
+def test_spoken_and_numeric_dates_normalize_to_dd_mmm_yyyy(
+    statement, expected_iso, expected_display
+):
+    result = normalize_onset_statement(statement, FIXED_REFERENCE)
+
+    assert result.normalized_iso == expected_iso
+    assert result.display == expected_display
+    assert result.source == "explicit"
+    # The original wording is preserved verbatim for the audit trail.
+    assert result.original == statement
+
+
+def test_relative_dates_anchor_to_the_conversation_timestamp():
+    # Fixed reference: 9 October 2026 (local offset frame).
+    for statement, expected_iso in (
+        ("yesterday", "2026-10-08"),
+        ("today", "2026-10-09"),
+        ("two days ago", "2026-10-07"),
+        ("two days back", "2026-10-07"),
+        ("three days ago", "2026-10-06"),
+    ):
+        result = normalize_onset_statement(statement, FIXED_REFERENCE)
+        assert result.normalized_iso == expected_iso, statement
+        assert result.source == "normalized", statement
+        assert result.period is None  # no clock time is ever invented
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "sometime in May",
+        "May 2026",
+        "the fourteenth",
+        "fourteenth of May",  # no year: never guessed
+    ],
+)
+def test_partial_or_ambiguous_spoken_dates_stay_unresolved(statement):
+    result = normalize_onset_statement(statement, FIXED_REFERENCE)
+
+    assert result.normalized_iso is None
+    assert result.source == "unknown"
+    # The original wording is retained exactly as reported.
+    assert result.original == statement
+
+
+def test_workflow_report_shows_normalized_onset_and_unknown_time():
+    engine = _engine_ready_for_onset("onset-spoken-report")
+    engine.update("seriousness", "no")
+    workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
+
+    result = workflow.process_turn("fourteenth of May twenty twenty six")
+
+    collected = result.collected_information
+    # Verbatim wording for audit; DD-MMM-YYYY for the report display.
+    assert collected["onset_date"] == "fourteenth of May twenty twenty six"
+    assert collected["onset_date_normalized"] == "2026-05-14"
+    assert collected["onset_date_display"] == "14-May-2026"
+    assert collected["onset_date_source"] == "explicit"
+    # No time was supplied: the period stays unset (shown as unknown).
+    assert collected["onset_period"] is None
+    assert engine.to_dict()["onset_date_display"] == "14-May-2026"
 
 
 # ---- reference resolution ---------------------------------------------------
@@ -303,16 +383,22 @@ def _turn(client: TestClient, session_id: str) -> dict:
 
 
 def _script_to_onset() -> list[str]:
+    # Approved order: report -> Step 4 verification -> reporter identity ->
+    # patient name and age (combined read-back) -> contact number (read-back)
+    # -> consent -> optional email declined -> severity -> incident date.
     return [
         "I took Lantus yesterday and today I have severe headache and vomiting. "
         "I want to report this adverse event.",
+        "yes",  # Step 4: medication verified
         "I am the patient",
         "Alpha Jones",
-        "yes",
-        "45 years old",
-        "Yes, I consent",
-        "You can reach me by phone",
-        "9999990000",
+        "45 years old",  # age completes the details -> combined read-back
+        "yes",  # Step 6B.2: patient details confirmed
+        "9999990000",  # patient contact number -> read-back
+        "yes",  # contact number confirmed
+        "Yes, I consent",  # Step 7: consent to contact
+        "no",  # Step 8: the optional email address is declined
+        "no",  # Step 9: not severe -> the incident date is asked next
         "It started this morning",
     ]
 
@@ -320,7 +406,7 @@ def _script_to_onset() -> list[str]:
 def test_voice_endpoint_threads_stt_timestamp_into_onset_display():
     client = _build_client(_script_to_onset(), FIXED_TIMESTAMP)
     session_id = "onset-endpoint"
-    for _ in range(8):
+    for _ in range(11):
         _turn(client, session_id)
     onset_turn = _turn(client, session_id)
 
@@ -344,7 +430,7 @@ def test_voice_endpoint_threads_stt_timestamp_into_onset_display():
 def test_voice_endpoint_without_timestamp_keeps_original_wording():
     client = _build_client(_script_to_onset(), None)
     session_id = "onset-endpoint-no-ts"
-    for _ in range(8):
+    for _ in range(11):
         _turn(client, session_id)
     onset_turn = _turn(client, session_id)
 

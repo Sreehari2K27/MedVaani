@@ -31,7 +31,13 @@ REPORT = (
 REPORTER_ROLE = "I am the patient"
 PATIENT_NAME = "Alpha Jones"
 CORRECTED_NAME = "Beta Jones"
-READBACK = f"I heard {PATIENT_NAME}. Is that correct?"
+DOB = "27/05/2000"  # the person's answer
+DOB_NORMALIZED = "27-May-2000"  # stored/read back in DD-MMM-YYYY
+# Approved Step 6B.2: the name and the captured date/age are read back
+# together, and the value is only committed after an explicit confirmation.
+READBACK = (
+    f"I have your details as {PATIENT_NAME}, {DOB_NORMALIZED}. Is that correct?"
+)
 
 
 class QueueSTT:
@@ -78,9 +84,13 @@ def _turn(client: TestClient, session_id: str) -> dict:
 def _run_to_name_readback(
     session_id: str, replies: list[str]
 ) -> tuple[TestClient, dict]:
-    client = _build_client([REPORT, REPORTER_ROLE, PATIENT_NAME, *replies])
-    _turn(client, session_id)
-    _turn(client, session_id)
+    client = _build_client(
+        [REPORT, "yes", REPORTER_ROLE, PATIENT_NAME, DOB, *replies]
+    )
+    # Report, Step 4 medication verification, reporter role and the patient
+    # name (Step 6B.1); the date-of-birth turn returns the combined read-back.
+    for _ in range(4):
+        _turn(client, session_id)
     return client, _turn(client, session_id)
 
 
@@ -91,10 +101,10 @@ def test_name_capture_returns_readback_and_blocks_advancement():
     assert READBACK in data["response_text"]
     assert data["next_question"] == ["confirmation", READBACK]
     # The candidate was extracted but not collected: no premature advance.
-    assert data["current_state"] == "EVENT_IDENTIFIED"
+    assert data["current_state"] == "PRODUCT_IDENTIFIED"
     assert data["completed"] is False
     assert "patient_identifier" in data["missing_information"]
-    assert data["ae"]["extracted_information"]["patient_identifier"] == PATIENT_NAME
+    assert data["ae"]["extracted_information"]["patient_age"] == DOB_NORMALIZED
     assert data["ae"]["collected_information"]["patient_identifier"] is None
 
 
@@ -106,9 +116,10 @@ def test_yes_commits_confirmed_name_and_advances_across_requests():
 
     assert data["ae"]["collected_information"]["patient_identifier"] == PATIENT_NAME
     assert "patient_identifier" not in data["missing_information"]
-    assert data["current_state"] == "REPORTER_IDENTIFIED"
+    assert data["current_state"] == "PATIENT_IDENTIFIED"
     assert data["next_question"] is not None
-    assert data["next_question"][0] == "patient_age"
+    # The patient contact number is asked before consent (approved order).
+    assert data["next_question"][0] == "contact_phone"
     assert data["completed"] is False
 
 
@@ -118,18 +129,22 @@ def test_no_then_correction_is_read_back_again_before_advancing():
     )
 
     rejected = _turn(client, "confirm-correct")
-    assert "May I have your first and last name?" in rejected["response_text"]
+    # Only the incorrect field is asked for; nothing restarts.
+    assert "Was it the name or the date of birth that was incorrect?" in (
+        rejected["response_text"]
+    )
     assert rejected["next_question"] is not None
     assert rejected["next_question"][0] == "patient_identifier"
-    assert rejected["current_state"] == "EVENT_IDENTIFIED"
+    assert rejected["current_state"] == "PRODUCT_IDENTIFIED"
     assert rejected["ae"]["collected_information"]["patient_identifier"] is None
 
+    corrected_readback = (
+        f"I have your details as {CORRECTED_NAME}, {DOB_NORMALIZED}. "
+        "Is that correct?"
+    )
     corrected = _turn(client, "confirm-correct")
-    assert f"I heard {CORRECTED_NAME}. Is that correct?" in corrected["response_text"]
-    assert corrected["next_question"] == [
-        "confirmation",
-        f"I heard {CORRECTED_NAME}. Is that correct?",
-    ]
+    assert corrected_readback in corrected["response_text"]
+    assert corrected["next_question"] == ["confirmation", corrected_readback]
     assert corrected["ae"]["collected_information"]["patient_identifier"] is None
 
     confirmed = _turn(client, "confirm-correct")
@@ -137,9 +152,9 @@ def test_no_then_correction_is_read_back_again_before_advancing():
         confirmed["ae"]["collected_information"]["patient_identifier"]
         == CORRECTED_NAME
     )
-    assert confirmed["current_state"] == "REPORTER_IDENTIFIED"
+    assert confirmed["current_state"] == "PATIENT_IDENTIFIED"
     assert confirmed["next_question"] is not None
-    assert confirmed["next_question"][0] == "patient_age"
+    assert confirmed["next_question"][0] == "contact_phone"
 
 
 def test_ambiguous_reply_clarifies_without_advancing():
@@ -151,52 +166,65 @@ def test_ambiguous_reply_clarifies_without_advancing():
     # The read-back is re-asked so the turn cannot pass the name.
     assert READBACK in data["response_text"]
     assert data["next_question"] == ["confirmation", READBACK]
-    assert data["current_state"] == "EVENT_IDENTIFIED"
+    assert data["current_state"] == "PRODUCT_IDENTIFIED"
     assert data["completed"] is False
     assert "patient_identifier" in data["missing_information"]
     assert data["ae"]["collected_information"]["patient_identifier"] is None
 
 
-def test_only_integrated_fields_confirm_and_the_rest_capture_legacy_style():
-    # Phone contact after the confirmed name must keep legacy capture: no
-    # read-back, direct commit, workflow keeps its normal next question.
+def test_identity_and_contact_read_backs_commit_before_consent():
+    # Identity and contact values are read back and confirmed before the
+    # consent question (approved Steps 6B.2, 6B.3 and 6B.4).
     transcripts = [
         REPORT,
+        "yes",  # Step 4: medication verified
         REPORTER_ROLE,
         PATIENT_NAME,
-        "yes",
-        "45 years old",
-        "Yes, I consent",
-        "You can reach me by phone",
-        "9999990000",
+        DOB,
+        "yes",  # Step 6B.2: patient details confirmed
+        "9999990000",  # Step 6B.3
+        "yes",  # Step 6B.4: contact number confirmed
     ]
     client = _build_client(transcripts)
     session_id = "confirm-scope"
 
-    for _ in range(7):
-        data = _turn(client, session_id)
+    for _ in range(6):
+        _turn(client, session_id)
     phone_turn = _turn(client, session_id)
+    confirmed = _turn(client, session_id)
 
-    assert phone_turn["ae"]["collected_information"]["contact_phone"] == "9999990000"
-    assert phone_turn["next_question"] is not None
-    assert phone_turn["next_question"][0] == "onset_date"
-    assert "I heard" not in phone_turn["response_text"]
-    assert phone_turn["current_state"] == "CONTACT_CAPTURED"
+    # The number is read back (last digits) before it is committed.
+    assert phone_turn["next_question"] == [
+        "confirmation",
+        "I have the number ending in 0000. Is that correct?",
+    ]
+    assert phone_turn["ae"]["collected_information"]["contact_phone"] is None
+    assert phone_turn["current_state"] == "PATIENT_IDENTIFIED"
 
-    # The name integrated above was confirmed along the way.
-    assert data["ae"]["collected_information"]["patient_identifier"] == PATIENT_NAME
+    # The confirmed contact commits and consent (Step 7) is asked next.
+    assert confirmed["ae"]["collected_information"]["contact_phone"] == "9999990000"
+    assert confirmed["next_question"] is not None
+    assert confirmed["next_question"][0] == "consent_to_contact"
+    assert confirmed["current_state"] == "CONTACT_CAPTURED"
+    # The name confirmed above was committed along the way.
+    assert (
+        confirmed["ae"]["collected_information"]["patient_identifier"] == PATIENT_NAME
+    )
 
 
 def test_default_workflow_constructor_keeps_legacy_name_capture():
     engine = AEStateEngine.create_case("legacy-name-check")
     workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
     workflow.process_turn(REPORT)
+    workflow.process_turn("yes")  # Step 4: medication verified
     workflow.process_turn(REPORTER_ROLE)
     result = workflow.process_turn(PATIENT_NAME)
 
     assert engine.case.patient_identifier == PATIENT_NAME
     assert engine.case.pending_confirmation is None
     assert result.next_question is not None
+    # Without confirmations the name commits directly; the combined
+    # Step 6B.1 question then continues with the date of birth.
     assert result.next_question[0] == "patient_age"
     assert "I heard" not in result.response_text
 
@@ -207,32 +235,35 @@ def test_default_workflow_constructor_keeps_legacy_name_capture():
 def test_filler_is_stripped_from_the_corrected_name():
     transcripts = [
         REPORT,
+        "yes",  # Step 4: medication verified
         REPORTER_ROLE,
         PATIENT_NAME,
-        "no",
+        DOB,
+        "no",  # Step 6B.2 read-back rejected
         "no, only alpha beta",
         "yes",
     ]
     client = _build_client(transcripts)
     session_id = "confirm-filler"
 
-    for _ in range(4):  # report, role, name read-back, "no"
+    for _ in range(6):  # report, Step 4, role, name, DOB, rejection
         _turn(client, session_id)
     correction = _turn(client, session_id)
 
+    corrected_readback = (
+        f"I have your details as alpha beta, {DOB_NORMALIZED}. "
+        "Is that correct?"
+    )
     # "only" is filler: the read-back carries the clean value, not the filler.
-    assert "I heard alpha beta. Is that correct?" in correction["response_text"]
+    assert corrected_readback in correction["response_text"]
     assert "only alpha beta" not in correction["response_text"]
-    assert correction["next_question"] == [
-        "confirmation",
-        "I heard alpha beta. Is that correct?",
-    ]
+    assert correction["next_question"] == ["confirmation", corrected_readback]
     # The corrected value is still only a candidate until confirmed.
     assert correction["ae"]["collected_information"]["patient_identifier"] is None
 
     confirmed = _turn(client, session_id)
     assert confirmed["ae"]["collected_information"]["patient_identifier"] == "alpha beta"
-    assert confirmed["current_state"] == "REPORTER_IDENTIFIED"
+    assert confirmed["current_state"] == "PATIENT_IDENTIFIED"
 
 
 def test_affirmative_with_a_new_value_clarifies_instead_of_silently_accepting():
@@ -244,7 +275,7 @@ def test_affirmative_with_a_new_value_clarifies_instead_of_silently_accepting():
     # committed nor silently replaced.
     assert READBACK in data["response_text"]
     assert data["ae"]["collected_information"]["patient_identifier"] is None
-    assert data["current_state"] == "EVENT_IDENTIFIED"
+    assert data["current_state"] == "PRODUCT_IDENTIFIED"
     assert data["completed"] is False
 
 
@@ -254,8 +285,10 @@ def test_affirmative_with_a_new_value_clarifies_instead_of_silently_accepting():
 def test_repeated_failed_confirmations_park_the_report_for_human_review():
     transcripts = [
         REPORT,
+        "yes",  # Step 4: medication verified
         REPORTER_ROLE,
         PATIENT_NAME,
+        DOB,
         "I'm not sure",  # attempt 1 -> clarification
         "maybe",  # attempt 2 -> clarification
         "not sure",  # attempt 3 -> human review
@@ -263,11 +296,11 @@ def test_repeated_failed_confirmations_park_the_report_for_human_review():
     client = _build_client(transcripts)
     session_id = "confirm-review"
 
-    for _ in range(5):
+    for _ in range(7):
         data = _turn(client, session_id)
     # Attempts 1 and 2 still clarify and keep asking.
     assert "please say yes" in data["response_text"]
-    assert data["current_state"] == "EVENT_IDENTIFIED"
+    assert data["current_state"] == "PRODUCT_IDENTIFIED"
     assert data["human_review_required"] is False
 
     final = _turn(client, session_id)
@@ -304,7 +337,10 @@ def test_contact_confirmation_uses_the_same_attempt_bound():
         engine, AnswerLLMProvider(), confirm_fields=CONFIRMATION_FIELDS
     )
     readback = workflow.process_turn("9999990000")
-    assert "I heard your phone number as 9999990000" in readback.response_text
+    # Approved Step 6B.4: the number is read back with its last digits.
+    assert "I have the number ending in 0000. Is that correct?" in (
+        readback.response_text
+    )
     assert engine.case.contact_phone is None  # candidate only, not committed
 
     first = workflow.process_turn("not sure")
