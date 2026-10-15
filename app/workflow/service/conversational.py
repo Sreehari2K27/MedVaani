@@ -492,7 +492,9 @@ _FIELD_CLARIFICATIONS: Dict[str, str] = {
     "adverse_event": "Sorry, could you describe the side effect in a few words?",
     "reporter_role": "Just to check - are you reporting your own experience, or someone else's?",
     "patient_identifier": "Could you say your first and last name again?",
-    "patient_age": "Could you tell me your age in years, or your date of birth?",
+    # The approved flow collects a date of birth: the clarification never
+    # offers an age as a substitute.
+    "patient_age": "Could you say the date of birth again?",
     "consent_to_contact": "Would it be alright if we contact you later - yes or no?",
     "contact_method": "Which is easier for you - phone, email, or both?",
     "contact_phone": "Could you repeat the phone number, digit by digit?",
@@ -730,6 +732,17 @@ class ConversationalAEWorkflow:
         self._email_offer_pending = False
         self._email_request_pending = False
 
+    def _display_question(self, question: str, text_mode: bool) -> str:
+        """Question wording for the current channel.
+
+        Text conversations carry no audio, so the spoken-only "heard"
+        confirmation wording becomes "understood"; the voice flow keeps its
+        existing wording unchanged.
+        """
+        if text_mode:
+            return question.replace("I heard ", "I understood ")
+        return question
+
     def _introduction_parts(self, description_captured: bool) -> List[str]:
         """Step 1: the fixed introduction, handled exactly once per session.
 
@@ -847,6 +860,9 @@ class ConversationalAEWorkflow:
         }
         if context:
             turn_context.update(context)
+        # Text turns carry no audio: confirmation wording says "understood"
+        # instead of the spoken-only "heard" (voice wording is unchanged).
+        text_mode = bool(turn_context.get("text_mode"))
 
         # Remember the conversation's own timestamp/timezone (from the STT
         # request) so a relative onset answer can be resolved later. First
@@ -1251,6 +1267,17 @@ class ConversationalAEWorkflow:
         elif confirmation_active:
             awaiting_correction = self.engine.case.confirmation_response == "no"
             verdict, payload = _classify_confirmation_turn(message, pending_field)
+            if (
+                verdict == "correction"
+                and pending_field == "patient_identifier"
+                and isinstance(payload, str)
+                and payload
+                and len(payload.split()) == 1
+                and re.fullmatch(r"[A-Za-z0-9 .'\-]+", payload)
+            ):
+                # A single Latin token ("hmm") is a mumble, never a first and
+                # last name: clarify instead of replacing the name candidate.
+                verdict = "ambiguous"
             if pending_field == "contact_email":
                 # Any reply carrying a usable address (written or spelled)
                 # is a correction/capture of the candidate - never a yes/no
@@ -1816,7 +1843,9 @@ class ConversationalAEWorkflow:
                 # The opening already ends with the event-description
                 # invitation: never ask the same question twice.
                 if not (opening_emitted and next_field[0] == "adverse_event"):
-                    response_parts.append(question)
+                    response_parts.append(
+                        self._display_question(question, text_mode)
+                    )
             elif completed:
                 # Step 11/12: the report is presented by the existing report
                 # mechanism on completion; the closing line follows it.
@@ -1850,7 +1879,11 @@ class ConversationalAEWorkflow:
             next_question=(
                 None
                 if closing_step_active
-                else (list(next_field) if next_field else None)
+                else (
+                    [next_field[0], self._display_question(next_field[1], text_mode)]
+                    if next_field
+                    else None
+                )
             ),
         )
 

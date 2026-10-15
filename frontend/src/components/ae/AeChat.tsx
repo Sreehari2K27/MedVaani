@@ -3,9 +3,6 @@ import lantusPen from "../../assets/lantus-solostar.png.png";
 import {
   AE_STAGES,
   OPENING_MESSAGE,
-  createConversation,
-  handleUserInput,
-  stageStateFor,
   stageStatusText,
   type AeChatMessage,
 } from "../../ae/aeDemoConversation";
@@ -195,12 +192,14 @@ interface AeChatProps {
 function AeChat({ initialMode = "demo" }: AeChatProps) {
   const [mode] = useState<"demo" | "live">(initialMode === "live" ? "live" : "demo");
 
-  // Existing client-side demo journey (typing) — unchanged behaviour.
-  const [conversation, setConversation] = useState(createConversation);
+  // Both the typed ("demo") and spoken (live) journeys run the same
+  // authoritative backend AE workflow: typed turns go through
+  // POST /text/conversation and recorded turns through /voice/conversation,
+  // sharing one session so the approved question order, confirmations and
+  // branches are identical. The mic stays disabled in typed mode.
   const [draft, setDraft] = useState("");
   const [micNotice, setMicNotice] = useState(false);
 
-  // Live voice journey backed by POST /voice/conversation.
   const [sessionId] = useState(newSessionId);
   const [liveMessages, setLiveMessages] = useState<AeChatMessage[]>([
     { id: "ae-live-open", role: "assistant", text: OPENING_MESSAGE },
@@ -341,22 +340,16 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [conversation.messages, liveMessages]);
+  }, [liveMessages]);
 
   useEffect(() => () => audioRef.current?.pause(), []);
 
   const handleSend = () => {
     const text = draft.trim();
     if (!text) return;
-    if (demoMode) {
-      // Existing client-side demo journey (typing) — unchanged behaviour.
-      setConversation((prev) => handleUserInput(prev, text));
-      setDraft("");
-      setMicNotice(false);
-      return;
-    }
-    // Live mode: the typed turn goes through the same backend workflow as a
-    // recorded turn (POST /text/conversation).
+    // Both modes share the backend text workflow (POST /text/conversation);
+    // typed turns never consume speech credits and follow the same approved
+    // question order as recorded turns.
     if (busy) return;
     void sendTextTurn(text);
   };
@@ -375,42 +368,26 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
   };
 
   const demoMode = mode === "demo";
-  const liveStates = demoMode
-    ? null
-    : liveStageStates(
-        liveBackend?.collected,
-        liveBackend?.completed ?? false,
-        liveBackend?.humanReviewRequired ?? false,
-        liveStarted,
-      );
+  const liveStates = liveStageStates(
+    liveBackend?.collected,
+    liveBackend?.completed ?? false,
+    liveBackend?.humanReviewRequired ?? false,
+    liveStarted,
+  );
 
   const stageState = (stageId: (typeof AE_STAGES)[number]["id"]) =>
-    liveStates ? liveStates[stageId] : stageStateFor(conversation, stageId);
+    liveStates[stageId];
 
-  const captured = demoMode
-    ? [
-        "Suspected product",
-        "Reported symptoms",
-        ...AE_STAGES.slice(1)
-          .filter((stage) => stageStateFor(conversation, stage.id) === "done")
-          .map((stage) => stage.label),
-      ]
-    : [
-        ...(liveStates && liveStates["what-happened"] === "done"
-          ? ["Suspected product", "Reported symptoms"]
-          : []),
-        ...(liveStates
-          ? AE_STAGES.slice(1)
-              .filter((stage) => liveStates[stage.id] === "done")
-              .map((stage) => stage.label)
-          : []),
-      ];
+  const captured = [
+    ...(liveStates["what-happened"] === "done"
+      ? ["Suspected product", "Reported symptoms"]
+      : []),
+    ...AE_STAGES.slice(1)
+      .filter((stage) => liveStates[stage.id] === "done")
+      .map((stage) => stage.label),
+  ];
 
-  const stillNeeded = demoMode
-    ? AE_STAGES.filter((stage) => stageStateFor(conversation, stage.id) === "todo").map(
-        (stage) => stage.label,
-      )
-    : missingLabels(liveBackend?.missing ?? []);
+  const stillNeeded = missingLabels(liveBackend?.missing ?? []);
 
   const hint = demoMode ? (
     micNotice ? (
@@ -451,8 +428,8 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
           ref={scrollRef}
           aria-live="polite"
         >
-          {(demoMode ? conversation.messages : liveMessages).map(renderMessage)}
-          {!demoMode && busy ? (
+          {liveMessages.map(renderMessage)}
+          {busy ? (
             <div className="ae-info-notice">
               MedVaani is processing your message…
             </div>

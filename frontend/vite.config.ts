@@ -19,6 +19,21 @@ export default defineConfig({
         secure: false,
         xfwd: false,
       },
+      // Typed AE conversation turns (POST /text/conversation) share the same
+      // FastAPI backend as the voice routes.
+      "/text": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: true,
+        secure: false,
+        xfwd: false,
+      },
+      // Dedicated MI chat endpoints (POST /mi/chat, POST /mi/transcribe).
+      "/mi": {
+        target: "http://127.0.0.1:8000",
+        changeOrigin: true,
+        secure: false,
+        xfwd: false,
+      },
       "/audio": {
         target: "http://127.0.0.1:8000",
         changeOrigin: true,

@@ -108,3 +108,10 @@ def test_registry_can_switch_between_providers():
     LLMProviderRegistry.set_default("mock")
     provider = LLMProviderRegistry.get()
     assert isinstance(provider, MockLLMProvider)
+
+
+def test_registry_mistral_provider_available_without_calls():
+    """The mistral registry entry instantiates but never calls the network."""
+    provider = LLMProviderRegistry.get("mistral")
+    assert isinstance(provider, MistralLLMProvider)
+    assert provider.api_key is None or isinstance(provider.api_key, str)

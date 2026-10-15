@@ -1,7 +1,7 @@
 """Focused tests for MI guardrails."""
 from __future__ import annotations
 
-from app.mi.guardrails import MIGuardrail, MIGHybridService
+from app.mi.guardrails import MIGuardrail, MIGHybridService, MIRule
 
 
 def test_normal_product_information_question_allowed():
@@ -34,6 +34,61 @@ def test_recommended_starting_dose_question_allowed():
 def test_adverse_reaction_product_information_allowed():
     result = MIGuardrail.check("What are the common adverse reactions listed in the package insert?")
     assert result.allowed is True
+
+
+def test_mechanism_of_action_questions_allowed():
+    """General mechanism questions are product information (the same
+    recognition SafetyLayer already applies for routing)."""
+    for question in (
+        "How does Lantus SoloStar work?",
+        "What is the mechanism of action of Lantus?",
+    ):
+        result = MIGuardrail.check(question)
+        assert result.allowed is True, question
+        assert result.rule is MIRule.ALLOWED_PRODUCT_INFO
+        assert result.requires_retrieval is True
+
+
+def test_manufacturer_instruction_questions_allowed():
+    """General device/leaflet how-to questions reach retrieval, including the
+    audited pen-use topics."""
+    for question in (
+        "How do I use the Lantus SoloStar pen?",
+        "How do I attach a new needle to the SoloStar pen?",
+        "How do I perform the safety test before injecting?",
+        "How do I remove and dispose of the needle after injection?",
+        "How do I check the insulin before using my Lantus SoloStar pen?",
+        "How do I select the dose and inject with the SoloStar pen?",
+    ):
+        result = MIGuardrail.check(question)
+        assert result.allowed is True, question
+        assert result.rule is MIRule.ALLOWED_PRODUCT_INFO
+
+
+def test_unsafe_intents_still_block_before_product_info_rule():
+    """The new product-info clauses never override the earlier safety checks:
+    personalized dosing, medication change and personalized treatment are
+    evaluated first and stay blocked."""
+    blocked_cases = (
+        ("How many units should I take tonight?", MIRule.BLOCKED_PERSONALIZED_DOSING),
+        (
+            "My blood sugar is 250. How many units of Lantus should I take?",
+            MIRule.BLOCKED_PERSONALIZED_DOSING,
+        ),
+        ("Should I stop taking Lantus?", MIRule.BLOCKED_MEDICATION_CHANGE),
+        ("Should I switch my insulin?", MIRule.BLOCKED_MEDICATION_CHANGE),
+        ("My sugar is high, what should I do?", MIRule.BLOCKED_PERSONALIZED_TREATMENT),
+    )
+    for question, rule in blocked_cases:
+        result = MIGuardrail.check(question)
+        assert result.allowed is False, question
+        assert result.rule is rule, question
+
+
+def test_arbitrary_what_should_i_do_stays_blocked():
+    """Scope stays limited: open-ended advice requests are not product info."""
+    result = MIGuardrail.check("What should I do if I miss a dose?")
+    assert result.allowed is False
 
 
 def test_personalized_dosing_request_blocked():

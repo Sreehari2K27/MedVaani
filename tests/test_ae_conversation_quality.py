@@ -100,7 +100,10 @@ def test_post_event_response_is_empathy_then_medication_question():
 
     result = workflow.process_turn("I have a headache")
     text = result.response_text
-    question = "Could you tell me the name of the medication involved?"
+    question = (
+        "To help us record your report correctly, could you tell me the name "
+        "of the medication involved?"
+    )
 
     empathy_at = text.index(MEDICATION_EMPATHY)
     question_at = text.index(question)
@@ -781,3 +784,124 @@ def test_invalid_dob_never_restores_or_confirms_a_stale_candidate():
     assert invalid.completed is False
     assert invalid.next_question is not None
     assert invalid.next_question[0] == "patient_age"
+
+
+# ---- combined name + typed DD-MMM-YYYY date of birth ------------------------
+
+
+def test_combined_name_and_ddmmyyyy_dob_extract_in_one_turn():
+    result = AnswerLLMProvider().interpret(
+        "Alpha Beta 21-Mar-2008",
+        {"next_field": ["patient_identifier", "What is your name?"]},
+    )
+
+    assert result.extracted_fields["patient_identifier"] == "Alpha Beta"
+    assert result.extracted_fields["patient_age"] == "21-Mar-2008"
+
+
+def _to_patient_details(case_id: str):
+    """Workflow with the combined patient-details question on the table."""
+    engine, workflow = _workflow(case_id)
+    workflow.process_turn("I had a stomach ache after taking this medication")
+    workflow.process_turn("Lantus")
+    workflow.process_turn("yes")  # Step 4
+    workflow.process_turn("myself")  # Step 5
+    return engine, workflow
+
+
+def test_combined_confirmation_without_a_second_dob_question():
+    engine, workflow = _to_patient_details("q-typed-dob")
+
+    confirmed_turn = workflow.process_turn("Alpha Beta 21-Mar-2008")
+
+    # Both values are captured in one turn: the combined read-back follows
+    # immediately - the date of birth is never asked for twice.
+    assert confirmed_turn.next_question is not None
+    assert confirmed_turn.next_question[0] == "confirmation"
+    assert (
+        "I have your details as Alpha Beta, 21-Mar-2008. Is that correct?"
+        in confirmed_turn.response_text
+    )
+    assert "Could you please tell me your date of birth?" not in (
+        confirmed_turn.response_text
+    )
+
+    committed = workflow.process_turn("yes")
+    assert engine.case.patient_identifier == "Alpha Beta"
+    assert engine.case.patient_age == "21-Mar-2008"
+    assert committed.next_question is not None
+    assert committed.next_question[0] == "contact_phone"
+
+
+def test_typed_dob_persists_across_later_turns():
+    engine, workflow = _to_patient_details("q-typed-dob-persist")
+    workflow.process_turn("Alpha Beta 21-Mar-2008")
+
+    # An unexpected turn neither wipes the date nor fabricates "unknown",
+    # and the name candidate is untouched.
+    clarification = workflow.process_turn("hmm")
+
+    assert engine.case.patient_age == "21-Mar-2008"
+    assert engine.case.confirmation_candidate == {"patient_identifier": "Alpha Beta"}
+    assert engine.case.patient_age != "unknown"
+    assert clarification.completed is False
+
+    workflow.process_turn("yes")
+    assert engine.case.patient_identifier == "Alpha Beta"
+    assert engine.case.patient_age == "21-Mar-2008"
+
+
+def test_no_age_question_is_ever_offered_for_the_patient_details():
+    engine, workflow = _to_patient_details("q-no-age-question")
+
+    asked = workflow.process_turn("myself")
+
+    question = asked.next_question[1]
+    # The approved flow collects a date of birth, never an age.
+    assert "date of birth" in question
+    assert "How old" not in question
+    assert "age in years" not in question
+
+
+def test_report_requires_every_mandatory_step_and_the_consent_decision():
+    engine, workflow = _to_patient_details("q-completion-gate")
+    workflow.process_turn("Alpha Beta 21-Mar-2008")
+    workflow.process_turn("yes")
+
+    # Identity captured but not everything: no report yet.
+    assert workflow.process_turn("9886094321").completed is False
+    assert "consent_to_contact" in engine.missing_information()
+    assert "seriousness" in engine.missing_information()
+
+    workflow.process_turn("yes")  # contact confirmed
+    assert workflow.process_turn("Yes, I consent").completed is False
+    assert workflow.process_turn("I don't have an email address").completed is False
+    assert workflow.process_turn("No, it was not severe").completed is False
+    assert workflow.process_turn("It started yesterday").completed is False
+    final = workflow.process_turn("no")  # additional information declined
+    assert final.completed is True
+
+
+def test_final_report_keeps_the_typed_dob_and_verbatim_event():
+    engine, workflow = _to_patient_details("q-final-dob-report")
+    workflow.process_turn("Alpha Beta 21-Mar-2008")
+    workflow.process_turn("yes")
+    workflow.process_turn("9886094321")
+    workflow.process_turn("yes")
+    workflow.process_turn("Yes, I consent")
+    workflow.process_turn("I don't have an email address")
+    workflow.process_turn("No, it was not severe")
+    workflow.process_turn("It started yesterday")
+    final = workflow.process_turn("no")
+
+    assert final.completed is True
+    collected = final.collected_information
+    assert collected["adverse_event"] == (
+        "I had a stomach ache after taking this medication"
+    )
+    assert collected["patient_identifier"] == "Alpha Beta"
+    assert collected["patient_age"] == "21-Mar-2008"
+    assert collected["patient_age"] != "unknown"
+    snapshot = engine.to_dict()
+    assert snapshot["patient"]["age"] == "21-Mar-2008"
+    assert snapshot["report_complete"] is True

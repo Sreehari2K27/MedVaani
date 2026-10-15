@@ -77,7 +77,8 @@ def tokenize_text(text: str) -> list[str]:
 _QUERY_EXPANSIONS = (
     (re.compile(r"(?i)used\s+for\b"), "indication indicated therapeutic"),
     (re.compile(r"(?i)side\s+effects?\b"), "adverse reaction undesirable"),
-    (re.compile(r"(?i)how\s+does\b.*\bwork\b|mechanism\s+of\s+action"), "action long acting analogue"),
+    (re.compile(r"(?i)how\s+does\b.*\bwork\b|mechanism\s+of\s+action"),
+     "mode action pharmacodynamic insulin glargine"),
     (re.compile(r"(?i)stor(?:e|ed|age|ing)\b|refrigerat\w*|fridge"), "storage refrigerat freezer"),
     (re.compile(r"(?i)miss(?:ed)?\s+a\s+dose|forget"), "missed dose skip injection"),
 )
@@ -102,6 +103,17 @@ class RetrievedChunk:
     metadata: Optional[Dict[str, Any]] = None
 
 
+# Relevance blending for candidate reranking: cosine over a short chunk can be
+# dominated by repetitions of the product name, letting packaging/labeling
+# chunks outrank the section that actually answers the question. Candidates
+# from the cosine top-pool are therefore re-scored as
+# cosine + _RERANK_ALPHA * (idf-weighted coverage of the expanded query
+# terms), where coverage counts DISTINCT matched terms (text + section
+# heading) so term frequency and chunk length cannot swamp subject relevance.
+_RERANK_POOL = 10
+_RERANK_ALPHA = 0.07
+
+
 class LantusRetriever:
     """Lightweight TF-IDF based retriever."""
 
@@ -110,6 +122,8 @@ class LantusRetriever:
         self.chunks: List[Dict[str, Any]] = self._load_chunks()
         self.vectorizer = None
         self.tfidf_matrix = None
+        self._idf: Dict[str, float] = {}
+        self._chunk_terms: List[set] = []
         self._build_index()
 
     def _load_chunks(self) -> List[Dict[str, Any]]:
@@ -126,6 +140,22 @@ class LantusRetriever:
             return
         self.vectorizer = TfidfVectorizer(analyzer=tokenize_text, max_features=2000)
         self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+        self._idf = dict(
+            zip(self.vectorizer.get_feature_names_out(), self.vectorizer.idf_)
+        )
+        # Per-chunk term sets (body text + section heading) for rerank coverage.
+        self._chunk_terms = [
+            set(tokenize_text(c["text"]))
+            | set(tokenize_text(c.get("section_heading") or ""))
+            for c in self.chunks
+        ]
+
+    def _coverage(self, query_terms: set, index: int) -> float:
+        """idf-weighted count of distinct query terms covered by one chunk."""
+        if not query_terms or index >= len(self._chunk_terms):
+            return 0.0
+        matched = query_terms & self._chunk_terms[index]
+        return sum(self._idf.get(term, 0.0) for term in matched)
 
     def retrieve(self, query: str, k: int = 3) -> List[RetrievedChunk]:
         if not query or not query.strip():
@@ -155,14 +185,23 @@ class LantusRetriever:
                 for s, c in top
             ]
 
-        # TF-IDF similarity
-        query_vec = self.vectorizer.transform([expand_query(query)])
+        # TF-IDF similarity, then a subject-coverage rerank of the top pool
+        # (see _RERANK_* above). `relevance_score` stays the cosine value.
+        expanded = expand_query(query)
+        query_vec = self.vectorizer.transform([expanded])
         sims = cosine_similarity(query_vec, self.tfidf_matrix).flatten()
-        top_indices = sims.argsort()[::-1][:k]
+        pool = [
+            idx for idx in sims.argsort()[::-1][:_RERANK_POOL] if sims[idx] > 0
+        ]
+        query_terms = set(tokenize_text(expanded))
+        pool.sort(
+            key=lambda idx: (
+                -(sims[idx] + _RERANK_ALPHA * self._coverage(query_terms, idx)),
+                -sims[idx],
+            )
+        )
         results = []
-        for idx in top_indices:
-            if sims[idx] <= 0:
-                continue
+        for idx in pool[:k]:
             c = self.chunks[idx]
             results.append(
                 RetrievedChunk(

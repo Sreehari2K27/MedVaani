@@ -21,6 +21,18 @@ def test_retrieve_indication_question():
     assert results[0].text
 
 
+def test_used_for_question_ranks_indication_chunk_first():
+    """The indication page (page 1), not packaging/leaflet text, must lead."""
+    retriever = LantusRetriever()
+    results = retriever.retrieve("What is Lantus SoloStar used for?", k=3)
+    top = results[0]
+    lowered = top.text.lower()
+    assert top.page_number == 1
+    assert "indication" in lowered
+    assert "instruction leaflet" not in lowered
+    assert "shelf life" not in lowered
+
+
 def test_retrieve_storage_question():
     retriever = LantusRetriever()
     results = retriever.retrieve("storage", k=2)

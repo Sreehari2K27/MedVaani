@@ -31,6 +31,7 @@ from app.api.errors import (
     VALIDATION_ERRORS,
 )
 from app.api.voice_conversation import create_voice_conversation_router
+from app.api.mi_chat import create_mi_chat_router
 
 ROUND_TRIP_RESPONSE_TEXT = "Thank you. I received your message through MedVaani."
 
@@ -101,6 +102,10 @@ def create_app(
             ask_additional_information=True,
         )
     )
+
+    # Dedicated MI chat endpoints (text-only answers, Prisma STT for the
+    # microphone; no TTS and no AE session state).
+    application.include_router(create_mi_chat_router(stt=prisma_service))
 
     # Serve generated TTS audio (output/) so clients can play response audio.
     output_dir = Path("output")

@@ -214,7 +214,8 @@ def test_medication_identification_precedes_medication_scope_verification():
     # Step 2 -> Step 3 (with the one-time empathy) -> Step 4 -> Step 5.
     assert records[1]["next_key"] == "product"
     assert records[1]["next_text"] == (
-        "Could you tell me the name of the medication involved?"
+        "To help us record your report correctly, could you tell me the name "
+        "of the medication involved?"
     )
     assert MEDICATION_EMPATHY in records[1]["response"]
     assert records[2]["next_key"] == "product_verification"
@@ -263,7 +264,8 @@ def test_bare_no_to_the_medication_verification_asks_for_the_medicine_again():
     assert denied.next_question is not None
     assert denied.next_question[0] == "product"
     assert denied.next_question[1] == (
-        "Could you tell me the name of the medication involved?"
+        "To help us record your report correctly, could you tell me the name "
+        "of the medication involved?"
     )
     # Nothing out-of-scope is claimed, nothing is discarded, nothing invented.
     assert "configured for Lantus SoloStar only" not in denied.response_text

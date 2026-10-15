@@ -12,6 +12,10 @@ export const RECORDER_MAX_SECONDS = 60;
 interface UseWavRecorderOptions {
   maxSeconds?: number;
   onStop?: (blob: Blob) => void;
+  // Optional notice fired when the automatic duration limit stops the
+  // recording (before the final onStop). Undefined by default, so existing
+  // callers (the AE voice journey) behave exactly as before.
+  onLimitReached?: () => void;
 }
 
 interface UseWavRecorderResult {
@@ -74,6 +78,7 @@ function permissionMessage(error: unknown): string {
 export function useWavRecorder({
   maxSeconds = RECORDER_MAX_SECONDS,
   onStop,
+  onLimitReached,
 }: UseWavRecorderOptions = {}): UseWavRecorderResult {
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -86,8 +91,10 @@ export function useWavRecorder({
   const timerRef = useRef<number | null>(null);
   const activeRef = useRef(false);
   const onStopRef = useRef(onStop);
+  const onLimitReachedRef = useRef(onLimitReached);
 
   onStopRef.current = onStop;
+  onLimitReachedRef.current = onLimitReached;
 
   const cleanup = useCallback(() => {
     if (timerRef.current !== null) {
@@ -161,7 +168,10 @@ export function useWavRecorder({
       gainRef.current = gain;
       activeRef.current = true;
       setRecording(true);
-      timerRef.current = window.setTimeout(finish, maxSeconds * 1000);
+      timerRef.current = window.setTimeout(() => {
+        onLimitReachedRef.current?.();
+        finish();
+      }, maxSeconds * 1000);
       return true;
     } catch (err) {
       cleanup();

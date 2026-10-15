@@ -43,7 +43,19 @@ _PERSONALIZED_TREATMENT_PATTERNS = re.compile(
 _PRODUCT_INFO_PATTERNS = re.compile(
     r"(?i)(what\s+is\s+lantus|used\s+for|indication|storage|stor(?:e|ed|ing)"
     r"|refrigerat|fridge|adverse\s+reaction|side\s+effect|common.*reaction"
-    r"|how\s+to\s+store|be\s+stored|starting\s+dose|recommended\s+dose|package\s+insert)"
+    r"|how\s+to\s+store|be\s+stored|starting\s+dose|recommended\s+dose|package\s+insert"
+    # General mechanism-of-action questions. Mirrors SafetyLayer's clause so
+    # both classifiers agree that "How does Lantus SoloStar work?" is product
+    # information (routing already sent it here; the MI chat gate must not
+    # reject it as out of scope).
+    r"|how\s+does\s+.*work|mechanism\s+of\s+action"
+    # General manufacturer-instruction questions about the device/leaflet
+    # ("How do I use the pen?", "How do I attach a needle?", "How do I
+    # perform the safety test?"). The personalized dosing, medication-change
+    # and personalized-treatment checks above run FIRST, so unsafe intents
+    # are still blocked before this rule is ever consulted.
+    r"|how\s+(?:to\s+use|do\s+i\b[^.?!]{0,80}"
+    r"(?:use|pen\b|needle|attach|injec\w*|safety\s+test|prim\w*|cap|dispose|discard|remove)))"
 )
 
 

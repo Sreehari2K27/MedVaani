@@ -257,6 +257,37 @@ _CLARIFY_REPLY = re.compile(
     r"|दोबारा|समझ\s+नहीं\s+आया|क्या",
     re.IGNORECASE,
 )
+# An obvious question is never an adverse-event description: an MI-style
+# question that reaches the AE interview (or a request to repeat) must be
+# re-asked, never stored as the reporter's own wording. "?" catches typed
+# questions; the anchored word list catches dictated ones whose transcript
+# carries no question mark - the same question-initial vocabulary the intent
+# router uses, plus explicit repeat/clarify requests.
+_QUESTION_INITIAL = re.compile(
+    r"^\s*(?:what|which|when|where|who|why|how|does|do|did|is|are|can|could|"
+    r"should|would|will|may|might|"
+    r"please\s+(?:repeat|clarify|say\s+(?:that\s+)?again))\b",
+    re.IGNORECASE,
+)
+# Negated auxiliaries and date-led openings are statements, not questions
+# ("do not report this", "is not working", "May 12 I felt a rash").
+_QUESTION_NOT_STATEMENT = re.compile(r"^\s*not\b", re.IGNORECASE)
+_DATE_LED = re.compile(r"^\s*\d", re.IGNORECASE)
+
+
+def _is_obvious_question(text: str) -> bool:
+    """Whether ``text`` is plainly a question rather than a statement."""
+    stripped = text or ""
+    if "?" in stripped:
+        return True
+    match = _QUESTION_INITIAL.match(stripped)
+    if match is None:
+        return False
+    remainder = stripped[match.end() :]
+    if _QUESTION_NOT_STATEMENT.match(remainder) or _DATE_LED.match(remainder):
+        return False
+    return True
+
 _ROLE_SELF = re.compile(
     r"\b(?:i am|i'm|im|myself)\b[^.]{0,25}\bpatient\b|\bpatient\s+is\s+me\b|\bmyself\b"
     # Colloquial self-answers to the reporter-role question: "yes, it's me",
@@ -821,7 +852,10 @@ _DOB_NAME_LEAD = re.compile(
 )
 
 _DOB_MONTH_DATE = re.compile(
-    r"\b(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\.?\s+(\d{4})\b", re.IGNORECASE
+    # "12 March 1980", "21-Mar-2008" (day and month name may be joined by a
+    # space or a hyphen, the form a typed DD-MMM-YYYY answer produces).
+    r"\b(\d{1,2})(?:st|nd|rd|th)?[\s-]([A-Za-z]{3,9})\.?[\s-]+(\d{4})\b",
+    re.IGNORECASE,
 )
 _DOB_SLASH = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
 # DD-MM-YYYY, the format the flow asks the person to speak/type. Disjoint from
@@ -1087,10 +1121,18 @@ def _normalize_product(text: str) -> str | None:
 
 
 def _parse_initial_report(text: str) -> Dict[str, Any]:
-    """Extract product and the person's own description from a first report."""
+    """Extract product and the person's own description from a first report.
+
+    An obvious question is never a first report: nothing is extracted, so the
+    workflow simply asks for the event description again instead of opening a
+    report from the question itself.
+    """
     stripped = text.strip()
     lowered = stripped.lower()
     fields: Dict[str, Any] = {}
+
+    if _is_obvious_question(stripped):
+        return fields
 
     product = _normalize_product(stripped)
     if product:
@@ -1219,10 +1261,12 @@ def _volunteered_symptom(text: str) -> str | None:
     The original event description is never replaced; a later, clearly
     additive symptom statement is what this recognises so it can be appended
     instead of lost. Onset wording, outcome wording, medical-care statements,
-    negations and uncertainty are excluded so those answers are not mistaken
-    for new symptoms.
+    negations, uncertainty and obvious questions are excluded so those
+    answers are not mistaken for new symptoms.
     """
     lowered = text.lower()
+    if _is_obvious_question(text):
+        return None
     if not _SYMPTOM_LANGUAGE.search(lowered):
         return None
     if (
@@ -1547,7 +1591,14 @@ def _parse_for_pending_field(field_key: str, text: str) -> Dict[str, Any]:
             return {}
         return {"product": stripped}
     if field_key == "adverse_event":
-        if _NON_ANSWER.match(stripped) or _SIMPLE_YESNO.match(stripped):
+        if (
+            _NON_ANSWER.match(stripped)
+            or _SIMPLE_YESNO.match(stripped)
+            # An obvious question ("what are the side effects?", a request to
+            # repeat) answers no field: the workflow re-asks instead of
+            # storing the question as the reporter's own event description.
+            or _is_obvious_question(stripped)
+        ):
             return {}
         if _UNKNOWN_ANSWER.search(lowered):
             return {"adverse_event": "Unknown (to be confirmed)"}
@@ -1606,7 +1657,13 @@ class AnswerLLMProvider:
             if base.intent == "ae_report" and fresh:
                 initial = _parse_initial_report(message)
                 merged = dict(base.extracted_fields or {})
-                if "adverse_event" in merged or "adverse_event" in initial:
+                if _is_obvious_question(message):
+                    # A question is never the reporter's own description, even
+                    # when the fixed-phrase provider matched its wording: the
+                    # canned event is dropped instead of being replaced by the
+                    # question text.
+                    merged.pop("adverse_event", None)
+                elif "adverse_event" in merged or "adverse_event" in initial:
                     merged["adverse_event"] = message.strip()
                 for key, value in initial.items():
                     merged.setdefault(key, value)
@@ -1670,6 +1727,10 @@ class AnswerLLMProvider:
         merged = dict(base.extracted_fields or {})
         merged.update(fields)
         base.extracted_fields = merged
-        if fresh and ("product" in merged or "adverse_event" in merged):
+        if (
+            fresh
+            and not _is_obvious_question(message)
+            and ("product" in merged or "adverse_event" in merged)
+        ):
             base.intent = "ae_report"
         return base

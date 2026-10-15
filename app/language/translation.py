@@ -144,6 +144,9 @@ _HINDI_SENTENCES: dict[str, str] = {
     "Could you tell me your age in years, or your date of birth?": (
         "क्या आप मुझे वर्षों में अपनी उम्र बता सकते हैं, या आपकी जन्मतिथि?"
     ),
+    "Could you say the date of birth again?": (
+        "क्या आप जन्मतिथि दोबारा बता सकते हैं?"
+    ),
     "Would it be alright if we contact you later - yes or no?": (
         "क्या हम बाद में आपसे संपर्क कर सकते हैं - हाँ या ना?"
     ),
@@ -234,8 +237,9 @@ _HINDI_SENTENCES: dict[str, str] = {
         "आप अपने समय से बताइए\u2014मैं सुन रहा हूँ।"
     ),
     # Step 3 - medication question and its one-time empathy line.
-    "Could you tell me the name of the medication involved?": (
-        "क्या आप बता सकते हैं कि इसमें शामिल दवा का नाम क्या है?"
+    "To help us record your report correctly, could you tell me the name of the medication involved?": (
+        "रिपोर्ट सही ढंग से दर्ज करने में मदद के लिए, क्या आप बता सकते हैं कि "
+        "इसमें शामिल दवा का नाम क्या है?"
     ),
     "I'm sorry to hear that you've experienced this.": (
         "आपको यह अनुभव हुआ, यह जानकर मुझे खेद है।"

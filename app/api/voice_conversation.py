@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, UploadFile, HTTPException
@@ -21,6 +22,8 @@ from app.providers import (
     AnswerLLMProvider,
     FallbackLLMProvider,
     MockLLMProvider,
+    build_ae_llm_provider,
+    build_mi_llm_provider,
 )
 from app.language import (
     DEFAULT_LANGUAGE,
@@ -62,14 +65,16 @@ def _safe_detail(text: str) -> str:
 
 
 def get_llm_provider():
-    # Deterministic answer-aware provider wrapped in the fallback composite:
-    # a future primary LLM can be inserted without changing turn handling.
-    # No primary is configured today, so behavior is unchanged.
+    # Deterministic answer-aware provider wrapped in the fallback composite.
+    # Mistral assistance is opt-in (MISTRAL_AE_ENABLED + MISTRAL_API_KEY);
+    # while it is off, ``build_ae_llm_provider`` returns None and this is
+    # exactly today's wiring: no primary, deterministic fallback only.
     try:
         fallback = AnswerLLMProvider()
     except Exception:
         fallback = MockLLMProvider()
-    return FallbackLLMProvider(primary=None, fallback=fallback)
+    primary = build_ae_llm_provider(deterministic=fallback)
+    return FallbackLLMProvider(primary=primary, fallback=fallback)
 
 
 _default_mi_service = None
@@ -77,10 +82,16 @@ _default_mi_service = None
 
 def get_mi_service():
     # Default service is cached: the retriever loads the chunk index and fits
-    # TF-IDF once, not on every request.
+    # TF-IDF once, not on every request. The MI LLM provider is Mistral only
+    # when MISTRAL_MI_ENABLED + MISTRAL_API_KEY are set; otherwise the answer
+    # service keeps its deterministic default provider.
     global _default_mi_service
     if _default_mi_service is None:
-        _default_mi_service = MIGHybridService()
+        from app.mi.answer import MIAnswerService
+
+        _default_mi_service = MIGHybridService(
+            MIAnswerService(llm_provider=build_mi_llm_provider())
+        )
     return _default_mi_service
 
 
@@ -358,7 +369,13 @@ def process_transcript_turn(
         )
         session.context["ae_workflow"] = wf
     res = wf.process_turn(
-        transcript, context={"conversation_timestamp": conversation_timestamp}
+        transcript,
+        context={
+            "conversation_timestamp": conversation_timestamp,
+            # Text turns never carry audio: confirmation wording says
+            # "understood" instead of the spoken-only "heard".
+            "text_mode": synthesize is None,
+        },
     )
 
     # The reply's translated form is produced for BOTH voice and text turns so
@@ -422,7 +439,9 @@ def create_voice_conversation_router(
     def _get_llm():
         if llm_provider is not None:
             return llm_provider
-        return AnswerLLMProvider()
+        # Mistral assistance is opt-in; while disabled this is exactly the
+        # deterministic provider used today.
+        return build_ae_llm_provider() or AnswerLLMProvider()
 
     def _get_mi():
         if mi_service is not None:
@@ -532,6 +551,7 @@ def create_voice_conversation_router(
         session_id: str = Form(...),
         message: str = Form(...),
         language: str = Form("en-IN"),
+        conversation_timestamp: str = Form(""),
     ):
         """Typed conversational turn sharing the voice endpoint's workflow.
 
@@ -539,6 +559,12 @@ def create_voice_conversation_router(
         transcript routing, ConversationalAEWorkflow state, safety envelope,
         consent behaviour and additional-information handling as a voice
         transcript. Returns the same response envelope with ``audio_path`` null.
+
+        ``conversation_timestamp`` is optional: an explicit value (the
+        conversation's own reference) frames relative onset wording such as
+        "yesterday"; when omitted, the server's local receipt time (with its
+        offset) is used, and relative dates stay unresolved if no reliable
+        local frame exists (never guessed against a bare UTC clock).
         """
         if not session_id or not session_id.strip():
             raise HTTPException(status_code=400, detail="session_id is required")
@@ -547,14 +573,18 @@ def create_voice_conversation_router(
 
         session = store.get_or_create(session_id)
         hint = normalize_language(language) or DEFAULT_LANGUAGE
+        timestamp = (conversation_timestamp or "").strip() or None
+        if timestamp is None:
+            # Text turns have no STT provider timestamp: the conversation's
+            # own receipt time (local clock, with its offset) is the
+            # reference for relative onset dates.
+            timestamp = datetime.now().astimezone().isoformat()
         return JSONResponse(
             process_transcript_turn(
                 session,
                 session_id,
                 message.strip(),
-                # No STT means no provider timestamp; onset wording then keeps
-                # its original phrasing (never resolved against a server clock).
-                conversation_timestamp=None,
+                conversation_timestamp=timestamp,
                 provider_language=None,
                 request_language=language,
                 hint_language=hint,

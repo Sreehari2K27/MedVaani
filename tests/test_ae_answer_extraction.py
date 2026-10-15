@@ -1856,7 +1856,7 @@ def test_unclarifiable_age_parks_report_after_targeted_clarification():
     # instead of looping the generic question forever.
     workflow.process_turn("okay sure")
     targeted = workflow.process_turn("okay sure")
-    assert "Could you tell me your age in years" in targeted.response_text
+    assert "Could you say the date of birth again?" in targeted.response_text
     assert targeted.next_question is not None
     assert targeted.next_question[0] == "patient_age"
 
@@ -1873,9 +1873,7 @@ def test_unclarifiable_age_parks_report_after_targeted_clarification():
 def test_targeted_age_clarification_translates_to_hindi():
     from app.language import translate
 
-    result = translate(
-        "Could you tell me your age in years, or your date of birth?", "hi-IN"
-    )
+    result = translate("Could you say the date of birth again?", "hi-IN")
     assert result.translated is True
 
 
@@ -2101,3 +2099,66 @@ def test_unclear_product_replies_park_review_without_scope_stop():
     assert engine.case.product is None
     assert "configured for Lantus SoloStar only" not in third.response_text
     assert "product" in engine.missing_information()
+
+
+# ---- question-shaped text is never an adverse event -------------------------
+
+
+def test_fresh_mi_question_is_not_an_ae_report():
+    provider = AnswerLLMProvider()
+    result = provider.interpret(
+        "What are the common adverse reactions listed for Lantus SoloStar "
+        "in its product information?",
+        {},
+    )
+    assert "adverse_event" not in result.extracted_fields
+    assert result.intent != "ae_report"
+
+
+def test_fresh_product_free_question_is_not_captured():
+    result = AnswerLLMProvider().interpret(
+        "What are the possible side effects of this injection?", {}
+    )
+    assert "adverse_event" not in result.extracted_fields
+    assert result.intent != "ae_report"
+
+
+def test_mi_question_is_not_stored_when_adverse_event_pending():
+    engine = AEStateEngine.create_case("AE-question-guard-pending")
+    engine.update("product", "Lantus SoloStar")
+    workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
+
+    workflow.process_turn("What are the possible side effects of this injection?")
+
+    assert engine.case.adverse_event is None
+    # The workflow simply re-asks for the actual description.
+    assert "adverse_event" in engine.missing_information()
+
+
+def test_repeat_request_is_not_stored_as_adverse_event():
+    engine = AEStateEngine.create_case("AE-question-guard-repeat")
+    engine.update("product", "Lantus SoloStar")
+    workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
+
+    result = workflow.process_turn("Can you repeat that?")
+
+    assert engine.case.adverse_event is None
+    assert result.response_text
+    assert "adverse_event" in engine.missing_information()
+
+
+def test_genuine_event_statement_is_still_captured_verbatim():
+    statement = (
+        "I took Lantus yesterday and since this morning I have a "
+        "severe headache and vomiting."
+    )
+    result = AnswerLLMProvider().interpret(statement, {})
+    assert result.intent == "ae_report"
+    assert result.extracted_fields["adverse_event"] == statement
+
+
+def test_date_led_statement_is_not_treated_as_a_question():
+    statement = "May 12 I felt a rash after the injection"
+    result = AnswerLLMProvider().interpret(statement, {})
+    assert result.extracted_fields.get("adverse_event") == statement
+    assert result.intent == "ae_report"

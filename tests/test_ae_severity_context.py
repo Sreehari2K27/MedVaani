@@ -58,7 +58,7 @@ def test_event_description_is_preserved_and_medication_step_follows():
     assert engine.case.adverse_event == DESCRIPTION
     assert result.next_question is not None
     assert result.next_question[0] == "product"
-    assert "Could you tell me the name of the medication involved?" in (
+    assert "To help us record your report correctly, could you tell me the name" in (
         result.response_text
     )
 

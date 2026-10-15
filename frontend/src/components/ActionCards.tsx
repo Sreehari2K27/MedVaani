@@ -1,12 +1,25 @@
 ﻿interface ActionCardsProps {
   onReportSideEffect?: () => void;
+  onGetProductInfo?: () => void;
 }
 
-function ActionCards({ onReportSideEffect }: ActionCardsProps) {
+function ActionCards({ onReportSideEffect, onGetProductInfo }: ActionCardsProps) {
   return (
     <section style={styles.section}>
       <div className="container cards-grid">
-        <div style={styles.card} className="action-card lavender">
+        <div
+          style={styles.card}
+          className="action-card lavender"
+          role="button"
+          tabIndex={0}
+          onClick={onGetProductInfo}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              onGetProductInfo?.();
+            }
+          }}
+        >
           <div style={styles.iconWrapper} className="card-icon icon-lavender">
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>

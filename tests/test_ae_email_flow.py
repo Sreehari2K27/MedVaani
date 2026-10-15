@@ -384,9 +384,11 @@ def test_text_endpoint_drives_the_same_email_flow():
     assert offered["next_question"][1] == EMAIL_REQUEST_QUESTION
 
     readback = turn("alpha@example.com")
-    assert "I heard your email address as alpha@example.com." in (
+    # Text conversations use the text-appropriate confirmation wording.
+    assert "I understood your email address as alpha@example.com." in (
         readback["response_text"]
     )
+    assert "I heard" not in readback["response_text"]
 
     confirmed = turn("yes")
     collected = confirmed["ae"]["collected_information"]
@@ -523,3 +525,29 @@ def test_no_duplicate_email_question_in_one_response():
     captured = workflow.process_turn("alpha beta at gmail dot com")
     assert captured.response_text.count(EMAIL_REQUEST_QUESTION) <= 1
     assert captured.response_text.count("spell out your email address") <= 1
+
+
+def test_voice_flow_keeps_the_heard_email_confirmation_wording():
+    # The audio/voice path (no text_mode flag) keeps the spoken "heard"
+    # wording; only text conversations use "understood".
+    engine, workflow = _to_email_offer("em-voice-heard")
+    offered = workflow.process_turn("yes")
+    assert offered.next_question is not None
+
+    readback = workflow.process_turn("alpha@example.com")
+    assert "I heard your email address as alpha@example.com." in (
+        readback.response_text
+    )
+    assert "I understood" not in readback.response_text
+
+    # An explicit text-mode turn uses the text wording instead.
+    engine2, workflow2 = _to_email_offer("em-text-understood")
+    offered2 = workflow2.process_turn("yes")
+    assert offered2.next_question is not None
+    readback2 = workflow2.process_turn(
+        "alpha@example.com", context={"text_mode": True}
+    )
+    assert "I understood your email address as alpha@example.com." in (
+        readback2.response_text
+    )
+    assert "I heard" not in readback2.response_text

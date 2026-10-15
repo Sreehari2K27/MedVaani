@@ -105,7 +105,13 @@ def _question_for(key: str, case: "AECase") -> str:
     """
     third_person = case.reporter_role == "someone_else"
     if key == "product":
-        return "Could you tell me the name of the medication involved?"
+        # The one-time empathy line is prepended by the conversation service,
+        # so the spoken question reads as the approved compassionate
+        # transition into medication identification.
+        return (
+            "To help us record your report correctly, could you tell me the "
+            "name of the medication involved?"
+        )
     if key == "adverse_event":
         return (
             "Please tell me what happened, in your own words. "

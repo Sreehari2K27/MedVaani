@@ -149,6 +149,9 @@ export function buildLiveSummary(collected: AeCollectedInfo | null | undefined):
     });
   }
 
-  rows.push({ label: "Status", value: "Ready for human review" });
+  rows.push({
+    label: "Status",
+    value: "Structured report prepared for human PV review.",
+  });
   return rows;
 }

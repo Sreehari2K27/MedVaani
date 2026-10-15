@@ -52,7 +52,10 @@ function App() {
       content = (
         <>
           <Hero />
-          <ActionCards onReportSideEffect={openAe} />
+          <ActionCards
+            onReportSideEffect={openAe}
+            onGetProductInfo={() => navigate("mi")}
+          />
           <DisclaimerCard />
         </>
       );
