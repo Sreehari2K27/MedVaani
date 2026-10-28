@@ -7,7 +7,13 @@ import {
   type AeStageId,
   type AeStageState,
   type AeSummaryRow,
-} from "./aeDemoConversation";
+} from "./aeDemoConversation.ts";
+import {
+  capitalizeFirst,
+  englishCategory,
+  englishName,
+  englishReportText,
+} from "./reportEnglish.ts";
 
 export type AeCollectedInfo = Record<string, unknown>;
 
@@ -90,11 +96,18 @@ export function buildLiveSummary(collected: AeCollectedInfo | null | undefined):
   const outcome = asString(info.outcome);
 
   if (product) rows.push({ label: "Product", value: product });
-  if (events) rows.push({ label: "Reported events", value: events });
+  // The reported event is NEVER translated, transliterated, or rewritten:
+  // it is rendered from the stored verbatim value — the only display
+  // formatting is capitalizing the first character of the sentence
+  // ("abdominal pain…" -> "Abdominal pain…"), which is a no-op for
+  // non-Latin scripts. Every other character stays byte-for-byte.
+  if (events) rows.push({ label: "Reported event", value: capitalizeFirst(events) });
   // Patient identity: the name and the date of birth are separate, correctly
   // labelled fields. A stored date of birth is never displayed as an age;
   // only a stored numeric age is shown as an age (no age is calculated).
-  if (identifier) rows.push({ label: "Patient", value: identifier });
+  // Final-report rendering only: a Devanagari name is transliterated to
+  // Latin script ("यश गुप्ता" -> "Yash Gupta"); stored values are unchanged.
+  if (identifier) rows.push({ label: "Patient", value: englishName(identifier) });
   if (age) {
     if (/^\d{1,3}$/.test(age)) {
       rows.push({ label: "Age", value: `${age} years` });
@@ -102,21 +115,64 @@ export function buildLiveSummary(collected: AeCollectedInfo | null | undefined):
       rows.push({ label: "Date of birth", value: age });
     }
   }
+  // Unconfirmed held candidate (review-time only): shown exactly as
+  // captured, never as a committed or verified value.
+  const identifierHeld = asString(info.patient_identifier_held);
+  if (identifierHeld) {
+    rows.push({
+      label: "Patient (unconfirmed)",
+      value: `${englishName(identifierHeld)} — held for confirmation`,
+    });
+  }
   if (onset) {
     // Readable calendar date (DD-MMM-YYYY) with the reported wording retained;
     // unknown date and unknown time are called out distinctly rather than merged.
-    const datePart = onsetDisplay ?? "date unknown";
-    const timePart = onsetPeriod ?? "time unknown";
+    // The reported wording itself is presented in English (the stored verbatim
+    // value is untouched); the composed row starts capitalised
+    // ("Date unknown · time unknown · reported \"…\"").
+    const datePart = onsetDisplay ? englishReportText(onsetDisplay) : "date unknown";
+    const timePart = onsetPeriod ? englishReportText(onsetPeriod) : "time unknown";
     rows.push({
       label: "Onset",
-      value: `${datePart} · ${timePart} · reported "${onset}"`,
+      value: capitalizeFirst(
+        `${datePart} · ${timePart} · reported "${englishReportText(onset)}"`,
+      ),
     });
   }
   if (role) {
-    rows.push({ label: "Reporter", value: role === "self" ? "Patient" : "Reporter" });
+    // The confirmed reporter identity: in the other-person branch the
+    // reporter's own confirmed name is shown (transliterated like the
+    // patient row above); the self branch IS the patient and stays
+    // "Patient". Without a confirmed name the role label is kept.
+    const reporterName = asString(info.reporter_name);
+    rows.push({
+      label: "Reporter",
+      value:
+        role === "self"
+          ? "Patient"
+          : reporterName
+            ? englishName(reporterName)
+            : "Reporter",
+    });
+  }
+  // The reporter's own confirmed contact number: kept strictly separate
+  // from the patient Contact row below (patient phone · email) — it is
+  // never substituted by the email or the patient's number.
+  const reporterPhone = asString(info.reporter_contact_phone);
+  if (reporterPhone) {
+    rows.push({ label: "Reporter contact", value: reporterPhone });
   }
   const contact = [phone, email].filter(Boolean).join(" · ");
   if (contact) rows.push({ label: "Contact", value: contact });
+  // Unconfirmed held candidate (review-time only), like the held patient
+  // name above: never presented as committed or verified.
+  const phoneHeld = asString(info.contact_phone_held);
+  if (phoneHeld) {
+    rows.push({
+      label: "Contact (unconfirmed)",
+      value: `${phoneHeld} — held for confirmation`,
+    });
+  }
   // Consent is only "No" when it was explicitly declined: an unanswered
   // consent field is reported as not provided and never silently converted.
   rows.push({
@@ -129,9 +185,22 @@ export function buildLiveSummary(collected: AeCollectedInfo | null | undefined):
           : "Not provided",
   });
   if (seriousness && seriousness !== "unknown") {
-    rows.push({ label: "Seriousness", value: seriousness });
+    rows.push({ label: "Seriousness", value: englishCategory(seriousness) });
   }
   if (outcome) rows.push({ label: "Outcome", value: outcome });
+
+  // Reviewer-facing note (Option B): a short event description that matched
+  // no recognized symptom/report cue may be unclear speech. The captured
+  // description is still rendered above byte-for-byte untouched; this row
+  // only tells the human reviewer the wording may not be a complete
+  // description and must be judged by a person.
+  if (info.event_description_unclear === true) {
+    rows.push({
+      label: "Review note",
+      value:
+        "The reported event description was captured verbatim and may be unclear; it needs qualified human review.",
+    });
+  }
 
   // Optional closing detail. Kept separate from the structured fields above;
   // an explicit decline is shown as "None provided" rather than omitted.
@@ -140,7 +209,7 @@ export function buildLiveSummary(collected: AeCollectedInfo | null | undefined):
   if (additionalStatus === "provided" && additionalInfo) {
     rows.push({
       label: "Additional information provided by the patient",
-      value: additionalInfo,
+      value: englishReportText(additionalInfo),
     });
   } else if (additionalStatus === "declined") {
     rows.push({

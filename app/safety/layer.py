@@ -41,17 +41,16 @@ class SafetyResult:
 
 # Patterns for urgent/life-threatening situations. Kept in one authoritative
 # list so every workflow (voice and text) escalates on the same vocabulary.
+# The severity-bearing abdominal/stomach-pain vocabulary lives in
+# _ABDOMINAL_SEVERITY_PATTERNS below (see _is_fresh_intake for why it is
+# special-cased on a fresh case).
 _URGENT_PATTERNS = re.compile(
-    r"(?i)(severe\s+(difficulty\s+breathing|chest\s+pain|bleeding"
-    r"|(?:abdominal|stomach|belly)\s+pain)"
+    r"(?i)(severe\s+(difficulty\s+breathing|chest\s+pain|bleeding)"
     r"|difficulty\s+breathing"
     r"|unconscious|unconsciousness"
     r"|severe\s+chest\s+pain"
     r"|severe\s+bleeding"
     r"|chest\s+pain\s+(that\s+)?severe"
-    # Severe abdominal/stomach pain, mirroring the chest-pain forms above.
-    # Severity is required: mild stomach discomfort never matches.
-    r"|(?:abdominal|stomach|belly)\s+pain\s+(that\s+)?severe"
     r"|can'?t\s+breathe|hard\s+to\s+breathe"
     r"|not\s+breathing"
     r"|losing\s+consciousness"
@@ -83,22 +82,111 @@ _URGENT_PATTERNS = re.compile(
     # Hindi death reports (past-tense forms + the noun). Bare Devanagari: no
     # \b guards (matras); post-match negation covers "... नहीं".
     r"|मर\s+गया|मर\s+गई|मर\s+गए|मृत्यु"
-    # Severe abdominal/stomach pain in Hindi. Severity is mandatory, exactly
-    # like the English forms above: a bare "पेट दर्द" / "pet dard" mention is
-    # never urgent. Post-noun negation ("पेट दर्द नहीं है", "pet dard nahi
-    # hai") is cancelled by the existing Hindi after-match negation check.
+    r"|dil\s+ka\s+daura|mirgi|behosh|gambhir\s+allerg"
+    # Romanized Hindi death reports (English-script, so \b guards are safe).
+    r"|\bmar\s+gaya\b|\bmar\s+gayi\b|\bmar\s+gaye\b"
+    # Bengali urgent symptoms. Bare Bengali-script tokens: no \b guards
+    # (vowel signs are not word characters, mirroring the Devanagari rule);
+    # post-match negation ("... না / নেই") handles head-final denial.
+    r"|হার্ট\s+অ্যাট|স্ট্রোক|পক্ষাঘাত"
+    r"|খিঁচুনি|মৃগী"
+    r"|অজ্ঞান|অচেতন|জ্ঞান\s+হারা"
+    r"|শ্বাস\s+নিতে\s+কষ্ট|শ্বাসকষ্ট|শ্বাস\s+বন্ধ"
+    r"|অ্যানাফিল্যাক্সি|গুরুতর\s+অ্যালার্জি"
+    r"|ওভারডোজ"
+    r"|মারা\s+গে|মৃত্যু"
+    # Gujarati urgent symptoms (same bare-token rule).
+    r"|હાર્ટ\s+એટેક|હૃદયરોગનો\s+હુમલો"
+    r"|પક્ષાઘાત|લકવો"
+    r"|મરડી"
+    r"|બેભાન|મૂર્છા"
+    r"|શ્વાસ\s+લેવામાં\s+તકલીફ|શ્વાસ\s+લેવામાં\s+દિક્કત"
+    r"|એનાફિલેક્સિ|ગંભીર\s+એલર્જી"
+    r"|ઓવરડોઝ"
+    r"|મૃત્યુ\s+પામ|મરી\s+ગય|મૃત્યુ\s+થય"
+    # Kannada urgent symptoms (same bare-token rule).
+    r"|ಹೃದಯಾಘಾತ|ಪಕ್ಷವಾತ|ಪಾರ್ಶ್ವವಾಯು"
+    r"|ಅಪಸ್ಮಾರ|ಏಪು"
+    r"|ಮೂರ್ಛೆ|ಪ್ರಜ್ಞೆತಪ್ಪ|ಪ್ರಜ್ಞೆ\s+ಇಲ್ಲದ"
+    r"|ಉಸಿರು\s+ಕಟ್ಟ|ಉಸಿರಾಡಲು\s+ಆಗುತ್ತಿಲ್ಲ|ಉಸಿರಾಡಲು\s+ಆಗಲಿಲ್ಲ|ಉಸಿರಾಡಲು\s+ಕಷ್ಟ"
+    r"|ಅನಾಫಿಲ್ಯಾಕ್ಸಿ|ತೀವ್ರ\s+ಅಲರ್ಜಿ"
+    r"|ಓವರ್ಡೋಸ್"
+    r"|ಮರಣ\s+ಹೊಂದಿದ|ಸತ್ತ|ಪ್ರಾಣ\s+ಕಳೆದುಕೊಂಡ"
+    # Malayalam urgent symptoms (same bare-token rule).
+    r"|ഹൃദയാഘാതം|പക്ഷാഘാതം"
+    r"|അപസ്മാരം|വലിപ്പം"
+    r"|ബോധരഹിത|ബോധം\s+പോയി"
+    r"|ശ്വാസം\s+കിട്ടാതെ|ശ്വാസം\s+കുരുങ്ങി|ശ്വാസം\s+നിന്നുപോയി"
+    r"|അനാഫിലാക്സി|കടുത്ത\s+അലർജി"
+    r"|ഓവർഡോസ്"
+    r"|മരിച്ച|മരണമടഞ്ഞ"
+    # Marathi urgent symptoms (Devanagari, same bare-token rule as Hindi).
+    r"|हृदयविकाराचा\s+झटका|हार्ट\s+अट"
+    r"|लकवा|मिरगी"
+    r"|बेशुद्ध|मूर्च्छा|भान\s+हरप"
+    r"|श्वास\s+घेण्यास\s+त्रास|दम\s+घेण्यास\s+त्रास|श्वास\s+कठीण"
+    r"|एनाफिलॅक्सि|गंभीर\s+अ[ॅऍ]?लर्जी"
+    r"|ओव्हरडोझ"
+    r"|मरण\s+पावल|मृत्यू\s+झाल"
+    # Punjabi urgent symptoms (Gurmukhi, same bare-token rule).
+    r"|ਦਿਲ\s+ਦਾ\s+ਦੌਰਾ|ਹਾਰਟ\s+ਅਟੈਕ"
+    r"|ਸਟਰੋਕ|ਲਕਵਾ"
+    r"|ਮਿਰਗੀ"
+    r"|ਬੇਹੋਸ(?:਼|ਸ਼)?"
+    r"|ਸਾਹ\s+ਲੈਣ\s+ਵਿੱਚ\s+ਤਕਲੀਫ਼|ਸਾਹ\s+ਲੈਣ\s+ਵਿੱਚ\s+ਦਿੱਕਤ|ਸਾਹ\s+ਰੁਕ"
+    r"|ਐਨਾਫਿਲੈਕਸਿ|ਗੰਭੀਰ\s+ਐਲਰਜੀ"
+    r"|ਓਵਰਡੋਜ਼?"
+    r"|ਮਰ\s+ਗਿ|ਮੌਤ"
+    # Tamil urgent symptoms (same bare-token rule).
+    r"|மாரடைப்பு|பக்கவாதம்"
+    r"|வலிப்பு"
+    r"|மயக்கம(?:்|ா)|உணர்வற்ற"
+    r"|மூச்சு\s+விட\s+முடியவில்லை|மூச்சுத்\s*திணறல்|மூச்சு\s+விட\s+சிரமம்"
+    r"|அனாபிலாக்சி|கடும்\s+ஒவ்வாமை"
+    r"|ஓவர்டோஸ்"
+    r"|இறந்து|உயிரிழந்த"
+    # Telugu urgent symptoms (same bare-token rule).
+    r"|గుండెపోటు|పక్షవాతం"
+    r"|మూర్ఛ"
+    r"|స్పృహతప్ప|స్పృహ\s*లేకుండా"
+    r"|ఊపిరి\s+ఆడక|శ్వాస\s+ఆడక|శ్వాస\s+తీసుకోలేక"
+    r"|అనాఫిలాక్సి|తీవ్ర\s+అలర్జీ"
+    r"|ఓవర్డోస్"
+    r"|మరణించ|చనిపోయ|ప్రాణాలు\s+కోల్పో"
+    r"|life[-\s]threatening"
+    r"|emergency"
+    r")"
+)
+
+# Severity-bearing abdominal/stomach-pain vocabulary, split out from
+# _URGENT_PATTERNS because these phrases double as ordinary event-description
+# wording in Hindi/Hinglish/English ("bahut pet dard karne laga hai"). They
+# stay urgent in every situation EXCEPT as the opening event description of a
+# fresh case (see _is_fresh_intake): there the person is reporting what
+# happened, and severity is assessed at the designated severity step instead
+# of intercepting the intake. Once any wording is recorded on the case, these
+# phrases are urgent updates again, exactly as before. Standalone
+# classification (no case) is unchanged. Severity is mandatory in every
+# language: a bare "पेट दर्द" / "pet dard" or mild mention never matches.
+_ABDOMINAL_SEVERITY_PATTERNS = re.compile(
+    r"(?i)severe\s+(?:abdominal|stomach|belly)\s+pain"
+    r"|(?:abdominal|stomach|belly)\s+pain\s+(?:that\s+)?severe"
     r"|गंभीर\s+पेट\s*दर्द|तेज़?\s+पेट\s*दर्द|बहुत\s+पेट\s*दर्द"
     r"|पेट\s+में\s+बहुत\s+दर्द|पेट\s*दर्द\s+(?:बहुत|तेज़?|गंभीर)"
     # Romanized Hindi (STT commonly emits these spellings).
     r"|(?:bahut|bohot|buhut|tez|zyada|gambhir|severe)\s+(?:pet|pait)\s+(?:mein\s+)?dard"
     r"|(?:pet|pait)\s+mein\s+(?:bahut|bohot|buhut|tez|zyada|gambhir)\s+dard"
     r"|(?:pet|pait)\s+(?:mein\s+)?dard\s+(?:bahut|bohot|buhut|tez|zyada|gambhir)"
-    r"|dil\s+ka\s+daura|mirgi|behosh|gambhir\s+allerg"
-    # Romanized Hindi death reports (English-script, so \b guards are safe).
-    r"|\bmar\s+gaya\b|\bmar\s+gayi\b|\bmar\s+gaye\b"
-    r"|life[-\s]threatening"
-    r"|emergency"
-    r")"
+    # Severe abdominal pain in the other supported languages. Severity is
+    # mandatory in every language: a bare stomach-pain mention never matches.
+    r"|கடுமையான\s+வயிற்று\s+வலி|வயிற்றில்\s+கடும்\s+வலி"
+    r"|తీవ్రమైన\s+కడుపు\s+నొప్పి|కడుపులో\s+తీవ్ర\s+నొప్పి"
+    r"|ತೀವ್ರ\s+ಹೊಟ್ಟೆ\s+ನೋವು|ಹೊಟ್ಟೆಯಲ್ಲಿ\s+ತೀವ್ರ\s+ನೋವು"
+    r"|കടുത്ത\s+വയറുവേദന|വയറിൽ\s+കടുത്ത\s+വേദന"
+    r"|गंभीर\s+पोटदुखी|पोटात\s+जोरदार\s+दुखण"
+    r"|ગંભીર\s+પેટનો\s+દુખાવો|પેટમાં\s+ભારે\s+દુખાવો"
+    r"|তীব্র\s+পেট\s+ব্যথা|পেটে\s+প্রচণ্ড\s+ব্যথা"
+    r"|ਗੰਭੀਰ\s+ਪੇਟ\s+ਦਰਦ|ਪੇਟ\s+ਵਿੱਚ\s+ਬਹੁਤ\s+ਦਰਦ"
 )
 
 # Explicit denial of an urgent phrase ("I am not experiencing a
@@ -141,12 +229,63 @@ _NEGATION_WORDS = frozenset(
         "नही",
         "nahi",
         "nahin",
+        # Standalone negators of the other supported languages. These are
+        # script-distinct, so English matching is unaffected.
+        "இல்லை",
+        "இல்ல",
+        "లేదు",
+        "లేద",
+        "కాదు",
+        "ಇಲ್ಲ",
+        "ಅಲ್ಲ",
+        "ഇല്ല",
+        "അല്ല",
+        "नाही",
+        "नाहीत",
+        "નહીં",
+        "નહી",
+        "નથી",
+        "ના",
+        "না",
+        "নেই",
+        "নি",
+        "ਨਹੀਂ",
+        "ਨਹੀ",
+        "ਨਾ",
     }
 )
-# Hindi negation only: checked immediately AFTER a match as well, because
-# Hindi places the negation after the noun. English negation is deliberately
-# not checked after a match, so English behaviour stays exactly as before.
-_HINDI_NEGATION_TOKENS = frozenset({"नहीं", "नही", "nahi", "nahin"})
+# Head-final negation: checked immediately AFTER a match as well, because
+# Hindi and the other supported Indic languages typically place the negation
+# after the noun ("दिल का दौरा नहीं हुआ", "গুরুতর অ্যালার্জি নেই",
+# "గుండెపోటు లేదు"), which the clause-prefix check cannot see. English
+# negation is deliberately not checked after a match, so English behaviour
+# stays exactly as before.
+_AFTER_NEGATION_TOKENS = frozenset(
+    {
+        "नहीं",
+        "नही",
+        "nahi",
+        "nahin",
+        "இல்லை",
+        "లేదు",
+        "లేద",
+        "కాదు",
+        "ಇಲ್ಲ",
+        "ಅಲ್ಲ",
+        "ഇല്ല",
+        "അല്ല",
+        "नाही",
+        "नाहीत",
+        "નહીં",
+        "નહી",
+        "નથી",
+        "না",
+        "নেই",
+        "নি",
+        "ਨਹੀਂ",
+        "ਨਹੀ",
+    }
+)
 # Punctuation stripped from tokens, including the Devanagari danda ("।") and
 # a trailing full stop ("नहीं।", "nahi.").
 _TOKEN_STRIP = "\"'()[]{},;:!?।."
@@ -154,7 +293,7 @@ _CLAUSE_BOUNDARY = re.compile(
     r"[.,;!?]|\b(?:but|however|except|though|although|yet)\b", re.IGNORECASE
 )
 _NEGATION_WINDOW_WORDS = 6
-_HINDI_NEGATION_WINDOW_WORDS = 5
+_AFTER_NEGATION_WINDOW_WORDS = 5
 
 
 def _is_negated_at(text: str, match_start: int) -> bool:
@@ -163,26 +302,46 @@ def _is_negated_at(text: str, match_start: int) -> bool:
     return any(word.strip(_TOKEN_STRIP).lower() in _NEGATION_WORDS for word in recent)
 
 
-def _is_hindi_negated_after(match: re.Match) -> bool:
-    """Whether Hindi negation directly follows the matched urgent phrase.
+def _is_negated_after_match(match: re.Match) -> bool:
+    """Whether head-final negation directly follows the matched urgent phrase.
 
-    Hindi is head-final: "दिल का दौरा नहीं हुआ" / "dil ka daura nahi hua"
-    negate *after* the phrase, which the clause-prefix check cannot see. Only
-    the Hindi negation tokens are examined, so English text - where negation
+    Hindi and the other supported Indic languages are head-final:
+    "दिल का दौरा नहीं हुआ", "হার্ট অ্যাটাক নেই", "గుండెపోటు లేదు" negate
+    *after* the phrase, which the clause-prefix check cannot see. Only the
+    Indic negation tokens are examined, so English text - where negation
     precedes the phrase - is unaffected.
     """
-    following = match.string[match.end() :].split()[:_HINDI_NEGATION_WINDOW_WORDS]
+    following = match.string[match.end() :].split()[:_AFTER_NEGATION_WINDOW_WORDS]
     return any(
-        token.strip(_TOKEN_STRIP).lower() in _HINDI_NEGATION_TOKENS
+        token.strip(_TOKEN_STRIP).lower() in _AFTER_NEGATION_TOKENS
         for token in following
     )
 
 
-def _has_unnegated_urgent_match(text: str) -> bool:
+def _has_unnegated_match(text: str, pattern: re.Pattern) -> bool:
     return any(
         not _is_negated_at(text, match.start())
-        and not _is_hindi_negated_after(match)
-        for match in _URGENT_PATTERNS.finditer(text)
+        and not _is_negated_after_match(match)
+        for match in pattern.finditer(text)
+    )
+
+
+def _is_fresh_intake(case: Any | None) -> bool:
+    """Whether none of the person's wording has been recorded on ``case``.
+
+    On a fresh case the FIRST message is the initial event description. When
+    that opening statement carries severity-bearing abdominal wording (the
+    report itself: "… bahut pet dard karne laga hai"), it must be captured
+    verbatim and taken through the approved interview — severity is assessed
+    at the designated severity step — instead of being intercepted as an
+    in-progress urgent update. With no case context (standalone
+    classification, routing, MI) or once any wording is recorded, behaviour
+    is unchanged: these phrases classify as urgent exactly as before.
+    """
+    if case is None:
+        return False
+    return not getattr(case, "adverse_event", None) and not getattr(
+        case, "unclassified_initial_input", None
     )
 
 # Patterns for personalized treatment/dosing requests
@@ -240,8 +399,13 @@ class SafetyLayer:
 
         normalized = text.strip()
 
-        # Check for urgent/life-threatening first (highest priority)
-        if _has_unnegated_urgent_match(normalized):
+        # Check for urgent/life-threatening first (highest priority). The
+        # abdominal-severity class is urgent except as the fresh case's
+        # initial event description (see _is_fresh_intake).
+        if _has_unnegated_match(normalized, _URGENT_PATTERNS) or (
+            _has_unnegated_match(normalized, _ABDOMINAL_SEVERITY_PATTERNS)
+            and not _is_fresh_intake(case)
+        ):
             return SafetyResult(
                 signal=SafetySignal.URGENT_LIFE_THREATENING,
                 message=(

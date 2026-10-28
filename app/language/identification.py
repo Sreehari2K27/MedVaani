@@ -63,6 +63,46 @@ _STRONG_ROMANIZED_HINDI = frozenset(
 # session (e.g. Hindi) to English. Full English sentences are unaffected.
 _MIN_ENGLISH_TOKENS = 5
 
+# Devanagari digit words shared by the hi-IN/mr-IN pair plus the Devanagari
+# transliterations STT emits for spoken English digits. Devanagari is the
+# only script two supported locales share, so a digit-only utterance (a
+# dictated phone number) carries no evidence that can tell Hindi from
+# Marathi - and a marker-less tie-break would force Hindi onto a Marathi
+# session. Kept module-local: language identification never imports the
+# provider layer, and phone extraction is a different layer entirely.
+_DEVANAGARI_DIGIT_WORDS = frozenset(
+    {
+        # Hindi
+        "एक", "दो", "तीन", "चार", "पाँच", "पांच", "छह", "छः", "छे",
+        "सात", "आठ", "नौ", "शून्य",
+        # Marathi
+        "दोन", "पाच", "सहा", "नऊ",
+        # Devanagari transliterations of spoken English digits
+        "वन", "नाइन", "टू", "थ्री", "फोर", "फ़ोर", "फाइव", "सिक्स",
+        "सेवन", "एट", "ऐट", "जीरो", "ज़ीरो",
+    }
+)
+
+# Devanagari digit glyphs (०-९): a run of them is digit content too.
+_DEVANAGARI_DIGIT_GLYPHS = re.compile(r"^[\u0966-\u096F]+$")
+_DEVANAGARI_TOKENS = re.compile(r"[\u0900-\u097F]+")
+
+# Tokens that never identify a language by themselves: number words, single
+# letter-name spellings and the field-spelling cues around them. A phone
+# number, email address or identifier dictated in English words inside a
+# Malayalam (or any other) session is field content, not a language switch,
+# so such replies keep the conversation's established language. A genuine
+# English sentence keeps enough content tokens after this filter to detect.
+_WEAK_EVIDENCE_TOKENS = frozenset(
+    {
+        "zero", "one", "two", "three", "four", "five", "six", "seven",
+        "eight", "nine", "oh",
+        # Spelled-email / identifier cues (the same cues the AE email
+        # capture understands).
+        "at", "the", "rate", "dot", "underscore", "hyphen",
+    }
+)
+
 _LETTERS = re.compile(r"[A-Za-z]")
 _WORDS = re.compile(r"[A-Za-z]+")
 
@@ -95,11 +135,52 @@ def _latin_language(text: str) -> Optional[str]:
     markers = {token for token in tokens if token in _ROMANIZED_HINDI}
     if len(markers) >= 2 or any(token in _STRONG_ROMANIZED_HINDI for token in tokens):
         return "hi-IN"
-    # Short marker-less fragments ("myself", "yes that is fine", a name) are
-    # not evidence of English: keep whatever language the session established.
-    if len(tokens) < _MIN_ENGLISH_TOKENS:
+    # Weak-evidence tokens (number words, single letters, spelling cues) are
+    # removed before the English threshold is applied: dictating a phone
+    # number or email address in English words is field content, never a
+    # language switch, so it keeps the session's established language.
+    content = [
+        token
+        for token in tokens
+        if len(token) > 1 and token not in _WEAK_EVIDENCE_TOKENS
+    ]
+    if len(content) < _MIN_ENGLISH_TOKENS:
         return None
     return "en-IN"
+
+
+def _devanagari_digit_words_only(text: str) -> bool:
+    """Whether a Devanagari utterance consists entirely of digit words (or
+    digit glyphs): dictated-number content with no evidence that can tell
+    the shared-script Hindi/Marathi pair apart."""
+    tokens = _DEVANAGARI_TOKENS.findall(text)
+    if not tokens:
+        return False
+    for token in tokens:
+        if _DEVANAGARI_DIGIT_GLYPHS.match(token):
+            continue
+        if token in _DEVANAGARI_DIGIT_WORDS:
+            continue
+        return False
+    return True
+
+
+def _devanagari_marker_present(text: str) -> bool:
+    """Whether the text carries a Hindi or Marathi function-word marker.
+
+    Devanagari is the only script two supported locales share, so an
+    utterance with no distinguishing marker (short confirmations such as
+    "होय"/"बरोबर आहे"-style fragments, names, misrecognitions) cannot tell
+    the pair apart and is weak evidence: the caller keeps the session's
+    established language instead of forcing the marker-less tie-break.
+    """
+    for marker in _MARATHI_MARKERS:
+        if marker in text:
+            return True
+    for marker in _HINDI_MARKERS:
+        if marker in text:
+            return True
+    return False
 
 
 def detect_language(
@@ -129,6 +210,15 @@ def detect_language(
         if others[code] >= devanagari:
             return code
     if devanagari:
+        if _devanagari_digit_words_only(text):
+            # Digit-only Devanagari (a dictated number): no hi/mr evidence,
+            # so the caller keeps the session's established language.
+            return None
+        if not _devanagari_marker_present(text):
+            # Marker-less Devanagari (short confirmations, names,
+            # misrecognitions): the hi/mr tie-break would force Hindi onto
+            # an established Marathi session, so treat it as weak evidence.
+            return None
         return _devanagari_language(text)
     return _latin_language(text)
 

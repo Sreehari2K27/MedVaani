@@ -33,8 +33,10 @@ from app.language import (
     voice_for,
 )
 from app.session import SessionStore
+from app.workflow.onset import resolve_reference
 from app.workflow.service.conversational import (
     ConversationalAEWorkflow,
+    INTRODUCTION_MESSAGE,
     VOICE_CONFIRMATION_FIELDS,
 )
 from app.mi.guardrails import MIGHybridService
@@ -100,7 +102,9 @@ def _sanitize_filename_part(value: str) -> str:
     return sanitized or "default"
 
 
-def _upstream_to_http_error(exc: Exception) -> HTTPException:
+def _upstream_to_http_error(
+    exc: Exception, language_code: str | None = None
+) -> HTTPException:
     """Map one Prisma/Timbre failure to the clearest HTTP error.
 
     Distinct upstream causes must not all look like a generic outage:
@@ -108,13 +112,28 @@ def _upstream_to_http_error(exc: Exception) -> HTTPException:
     needs a pause, and everything else (timeouts, malformed bodies, empty
     transcripts, 5xx) stays a 502 that preserves the provider's message.
     No secrets (API keys) are included in any message.
+
+    The 403 branch additionally logs the provider's own denial reason (error
+    type and message) so an intermittent access denial can be diagnosed
+    without a live API call. Provider details are operator-side diagnostics
+    only: the patient-facing detail stays the generic hint, and the log
+    never carries API keys (masked by ``_safe_detail``), audio, or any AE
+    report content.
     """
     status = getattr(exc, "status_code", None)
     hint = getattr(exc, "hint", None)
     if status == 403:
+        # Sanitized and truncated: whitespace-normalised, API-key accidents
+        # masked, capped at 200 characters. Status/type/language only, never
+        # credentials, headers, audio or transcript content.
+        provider_message = _safe_detail(" ".join(str(exc).split()))[:200]
         logger.warning(
-            "Gnani STT rejected the request (HTTP 403): %s",
-            _safe_detail(hint or "check the API key and the account's credits"),
+            "Gnani STT rejected the request (HTTP %s, error_type=%s, "
+            "language=%s): %s",
+            status,
+            getattr(exc, "error_type", None) or "unspecified",
+            language_code or "unspecified",
+            provider_message or hint,
         )
         return HTTPException(
             status_code=500,
@@ -259,6 +278,27 @@ def _empty_transcript_response(session, session_id: str, language: str, synthesi
     )
 
 
+def _get_ae_workflow(session, *, get_llm, ask_additional_information: bool):
+    """Return the session's AE orchestrator, creating it once.
+
+    Cached on ``session.context`` so the voice-first greeting endpoint and
+    every later turn share one workflow instance — in particular one
+    introduction-once flag — keeping cross-turn state (e.g. the one-time
+    physician-consultation warning) across separate HTTP requests exactly as
+    before.
+    """
+    wf = session.context.get("ae_workflow")
+    if wf is None:
+        wf = ConversationalAEWorkflow(
+            session.ae_engine,
+            get_llm(),
+            confirm_fields=VOICE_CONFIRMATION_FIELDS,
+            ask_additional_information=ask_additional_information,
+        )
+        session.context["ae_workflow"] = wf
+    return wf
+
+
 def process_transcript_turn(
     session,
     session_id: str,
@@ -354,20 +394,16 @@ def process_transcript_turn(
             ),
         }
 
-    # AE workflow. Cache one orchestrator per session so cross-turn state
-    # (e.g. the one-time physician-consultation warning) persists across
-    # separate HTTP requests instead of resetting every turn. Identity and
-    # contact values are read back for explicit confirmation; session state
-    # (including a pending confirmation) lives on session.ae_engine.
-    wf = session.context.get("ae_workflow")
-    if wf is None:
-        wf = ConversationalAEWorkflow(
-            engine,
-            get_llm(),
-            confirm_fields=VOICE_CONFIRMATION_FIELDS,
-            ask_additional_information=ask_additional_information,
-        )
-        session.context["ae_workflow"] = wf
+    # AE workflow. One orchestrator per session (see ``_get_ae_workflow``) so
+    # cross-turn state (e.g. the one-time physician-consultation warning)
+    # persists across separate HTTP requests instead of resetting every turn.
+    # Identity and contact values are read back for explicit confirmation;
+    # session state (including a pending confirmation) lives on session.ae_engine.
+    wf = _get_ae_workflow(
+        session,
+        get_llm=get_llm,
+        ask_additional_information=ask_additional_information,
+    )
     res = wf.process_turn(
         transcript,
         context={
@@ -514,10 +550,21 @@ def create_voice_conversation_router(
                     return _empty_transcript_response(
                         session, session_id, language, synthesize=_synthesize
                     )
-                raise _upstream_to_http_error(exc) from exc
+                raise _upstream_to_http_error(
+                    exc, language_code=stt_language
+                ) from exc
 
             # Shared turn handling (routing, safety envelope, workflows) also
             # used by POST /text/conversation below.
+            stt_timestamp = getattr(transcription, "timestamp", None)
+            # The conversation's own reliable local frame, following the text
+            # conversation's established receipt-time rule: the STT timestamp
+            # when it already yields a timezone-aware reference; otherwise
+            # the server's aware receipt time. A naive STT instant is never
+            # assigned a guessed timezone and is never treated as UTC.
+            if resolve_reference(stt_timestamp, None) is None:
+                stt_timestamp = datetime.now().astimezone().isoformat()
+
             return JSONResponse(
                 process_transcript_turn(
                     session,
@@ -526,9 +573,7 @@ def create_voice_conversation_router(
                     # The STT provider's own timestamp is the conversation
                     # reference for resolving relative onset wording
                     # ("today morning", "yesterday").
-                    conversation_timestamp=getattr(
-                        transcription, "timestamp", None
-                    ),
+                    conversation_timestamp=stt_timestamp,
                     provider_language=getattr(
                         transcription, "detected_language", None
                     ),
@@ -545,6 +590,85 @@ def create_voice_conversation_router(
                 os.unlink(temp_file.name)
             except Exception:
                 pass
+
+    @r.post("/voice/introduction")
+    async def voice_introduction(
+        session_id: str = Form(...),
+        language: str = Form("en-IN"),
+    ):
+        """Deliver the approved AE opening once per fresh voice session.
+
+        The voice-first UI displays ``INTRODUCTION_MESSAGE`` as its single
+        chat greeting (or its translated spoken form, when the catalog covers
+        the requested language) and speaks it itself before the first
+        utterance, so this endpoint synthesizes that fixed approved text
+        through the existing translation catalog and Timbre configuration and
+        marks the session's workflow introduction as shown through the public
+        ``mark_introduction_shown()``. Nothing else
+        happens: no transcript, no engine turn, no case state, no question
+        consumed — the first utterance is processed by the ordinary workflow,
+        minus a repeated introduction. Marking happens before synthesis so a
+        TTS failure can never let a later turn repeat a greeting the UI has
+        already displayed. Idempotent: retries (e.g. a client replaying the
+        request) never re-open anything.
+        """
+        if not session_id or not session_id.strip():
+            raise HTTPException(status_code=400, detail="session_id is required")
+
+        session = store.get_or_create(session_id)
+        workflow = _get_ae_workflow(
+            session,
+            get_llm=_get_llm,
+            ask_additional_information=ask_additional_information,
+        )
+        workflow.mark_introduction_shown()
+
+        # Localize the approved introduction through the existing
+        # all-or-nothing translation catalog: an unsupported language or a
+        # missing translation keeps the approved English wording (translated
+        # False), so the UI never claims a localized introduction that was
+        # not actually spoken.
+        requested = normalize_language(language)
+        conversation_language = requested or DEFAULT_LANGUAGE
+        language_source = (
+            "hint" if requested not in (None, DEFAULT_LANGUAGE) else "default"
+        )
+        spoken = translate(INTRODUCTION_MESSAGE, conversation_language)
+        voice = voice_for(spoken.language) if spoken.translated else None
+        try:
+            audio_path = _synthesize_or_raise(
+                _synthesize,
+                spoken.text,
+                "intro",
+                session_id,
+                spoken.language,
+                voice=voice,
+            )
+        except HTTPException:
+            if not spoken.translated:
+                raise
+            # The localized synthesis failed: speak the approved English
+            # introduction instead and report it as untranslated - never a
+            # silent English fallback behind a localized claim.
+            spoken = translate(INTRODUCTION_MESSAGE, DEFAULT_LANGUAGE)
+            voice = None
+            audio_path = _synthesize_or_raise(
+                _synthesize, spoken.text, "intro", session_id, spoken.language
+            )
+        return JSONResponse(
+            {
+                "session_id": session_id,
+                "response_text": INTRODUCTION_MESSAGE,
+                "audio_path": str(audio_path),
+                **_language_metadata(
+                    spoken.language,
+                    spoken.text,
+                    voice,
+                    spoken.translated,
+                    language_source,
+                ),
+            }
+        )
 
     @r.post("/text/conversation")
     async def text_conversation(

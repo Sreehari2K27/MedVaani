@@ -74,12 +74,12 @@ function messageFor(
   return base;
 }
 
-async function postTurn(
+async function postTurn<T>(
   path: string,
   form: FormData,
   errors: Record<number, string>,
   label: string,
-): Promise<VoiceTurnResponse> {
+): Promise<T> {
   const response = await fetch(path, {
     method: "POST",
     body: form,
@@ -99,7 +99,7 @@ async function postTurn(
     );
   }
 
-  return (await response.json()) as VoiceTurnResponse;
+  return (await response.json()) as T;
 }
 
 // Map a browser locale (e.g. "hi-IN", "ml") to the BCP-47 language hint the
@@ -124,6 +124,27 @@ export function resolveRequestLanguage(locale?: string): string {
   return LOCALE_TO_LANGUAGE[base] ?? "en-IN";
 }
 
+// The ten locales the backend supports, for the explicit language selector.
+// Labels pair the readable native name with the BCP-47 code the backend
+// accepts; `code` is exactly the value posted as the initial `language` hint.
+export interface LanguageOption {
+  code: string;
+  label: string;
+}
+
+export const SUPPORTED_LANGUAGES: LanguageOption[] = [
+  { code: "en-IN", label: "English (en-IN)" },
+  { code: "hi-IN", label: "हिन्दी (hi-IN)" },
+  { code: "bn-IN", label: "বাংলা (bn-IN)" },
+  { code: "gu-IN", label: "ગુજરાતી (gu-IN)" },
+  { code: "kn-IN", label: "ಕನ್ನಡ (kn-IN)" },
+  { code: "ml-IN", label: "മലയാളം (ml-IN)" },
+  { code: "mr-IN", label: "मराठी (mr-IN)" },
+  { code: "pa-IN", label: "ਪੰਜਾਬੀ (pa-IN)" },
+  { code: "ta-IN", label: "தமிழ் (ta-IN)" },
+  { code: "te-IN", label: "తెలుగు (te-IN)" },
+];
+
 export async function postVoiceTurn(
   sessionId: string,
   blob: Blob,
@@ -133,7 +154,12 @@ export async function postVoiceTurn(
   form.append("audio_file", blob, "recording.wav");
   form.append("session_id", sessionId);
   form.append("language", language);
-  return postTurn("/voice/conversation", form, FRIENDLY_ERRORS, "Voice request failed");
+  return postTurn<VoiceTurnResponse>(
+    "/voice/conversation",
+    form,
+    FRIENDLY_ERRORS,
+    "Voice request failed",
+  );
 }
 
 // Typed AE/MI turn through the shared backend workflow (no STT/TTS).
@@ -146,7 +172,12 @@ export async function postTextTurn(
   form.append("session_id", sessionId);
   form.append("message", message);
   form.append("language", language);
-  return postTurn("/text/conversation", form, TEXT_ERRORS, "Text request failed");
+  return postTurn<VoiceTurnResponse>(
+    "/text/conversation",
+    form,
+    TEXT_ERRORS,
+    "Text request failed",
+  );
 }
 
 // "output/conv_ae_<session>.wav" -> "/audio/conv_ae_<session>.wav?_=<timestamp>"
@@ -156,4 +187,47 @@ export function audioUrlFor(audioPath: string): string {
   const normalized = audioPath.replace(/\\/g, "/");
   const name = normalized.substring(normalized.lastIndexOf("/") + 1);
   return `/audio/${name}?_=${Date.now()}`;
+}
+
+// One-shot delivery of the approved AE opening for a fresh voice session.
+// The endpoint also marks the session's workflow introduction as shown, so
+// the first utterance is never answered with a repeated introduction. The
+// text below is the same fixed wording the chat already seeds as its single
+// greeting; it is returned for verification only and must NOT be pushed as
+// another chat message.
+export interface GreetingResponse {
+  session_id: string;
+  response_text: string;
+  audio_path: string | null;
+  // Same additive language-mirroring metadata as a turn response.
+  conversation_language?: string;
+  spoken_response_text?: string | null;
+  voice?: string | null;
+  language_translated?: boolean;
+  language_source?: string;
+}
+
+export async function postGreeting(
+  sessionId: string,
+  language = "en-IN",
+): Promise<GreetingResponse> {
+  const form = new FormData();
+  form.append("session_id", sessionId);
+  form.append("language", language);
+  return postTurn<GreetingResponse>(
+    "/voice/introduction",
+    form,
+    TEXT_ERRORS,
+    "Greeting request failed",
+  );
+}
+
+// Visible text must always match what is spoken: when the backend
+// translated a response, the spoken form is authoritative; otherwise the
+// English text is what was spoken too (translation is all-or-nothing).
+export function assistantDisplayText(result: VoiceTurnResponse): string {
+  if (result.language_translated && result.spoken_response_text) {
+    return result.spoken_response_text;
+  }
+  return result.response_text;
 }

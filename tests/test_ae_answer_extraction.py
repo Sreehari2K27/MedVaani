@@ -18,10 +18,19 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.api.voice_conversation import create_voice_conversation_router
-from app.providers.answer import AnswerLLMProvider, parse_word_number, _extract_age
+from app.providers.answer import (
+    AnswerLLMProvider,
+    _extract_age,
+    _normalize_product,
+    normalized_dob_in,
+    parse_word_number,
+)
 from app.session import SessionStore
 from app.workflow.ae_engine import AEStateEngine, WorkflowState
-from app.workflow.service.conversational import ConversationalAEWorkflow
+from app.workflow.service.conversational import (
+    ConversationalAEWorkflow,
+    VOICE_CONFIRMATION_FIELDS,
+)
 
 EXACT_TRANSCRIPT = "I am the patient reporting this. I am thirty four years old"
 INITIAL_REPORT = (
@@ -534,6 +543,258 @@ def test_unclarifiable_phone_parks_report_for_human_review():
     # Previously captured report data is preserved.
     assert engine.case.product == "Lantus SoloStar"
     assert engine.case.consent_to_contact is True
+
+
+# One synthetic spoken-digit sequence per additional locale (zero..seven,
+# using each locale's reviewed digit words), mirroring the Hindi fixtures
+# above. No real contact information.
+_LOCALE_SPOKEN_PHONES = {
+    "ml-IN": ("പൂജ്യം ഒന്ന് രണ്ട് മൂന്ന് നാല് അഞ്ച് ആറ് ഏഴ്", "01234567"),
+    "bn-IN": ("শূন্য এক দুই তিন চার পাঁচ ছয় সাত", "01234567"),
+    "gu-IN": ("શૂન્ય એક બે ત્રણ ચાર પાંચ છ સાત", "01234567"),
+    "kn-IN": ("ಶೂನ್ಯ ಒಂದು ಎರಡು ಮೂರು ನಾಲು ಐದು ಆರು ಏಳು", "01234567"),
+    "mr-IN": ("शून्य एक दोन तीन चार पाच सहा सात", "01234567"),
+    "pa-IN": ("ਸਿਫ਼ਰ ਇੱਕ ਦੋ ਤਿੰਨ ਚਾਰ ਪੰਜ ਛੇ ਸੱਤ", "01234567"),
+    "ta-IN": ("பூஜ்ஜியம் ஒன்று இரண்டு மூன்று நான்கு ஐந்து ஆறு ஏழு", "01234567"),
+    "te-IN": ("సున్నా ఒకటి రెండు మూడు నాలుగు ఐదు ఆరు ఏడు", "01234567"),
+}
+
+
+@pytest.mark.parametrize(
+    ("locale", "spoken", "expected"),
+    [(loc, *pair) for loc, pair in sorted(_LOCALE_SPOKEN_PHONES.items())],
+    ids=str,
+)
+def test_spoken_digit_words_extract_phone_in_every_locale(locale, spoken, expected):
+    result = AnswerLLMProvider().interpret(spoken, {"next_field": CONTACT_PENDING})
+    assert result.extracted_fields["contact_phone"] == expected, spoken
+
+
+@pytest.mark.parametrize(
+    ("locale", "spoken", "expected"),
+    [(loc, *pair) for loc, pair in sorted(_LOCALE_SPOKEN_PHONES.items())],
+    ids=str,
+)
+def test_locale_spoken_phone_tolerates_punctuation_and_spacing(
+    locale, spoken, expected
+):
+    punctuated = ", ".join(spoken.split()) + "।"
+    result = AnswerLLMProvider().interpret(punctuated, {"next_field": CONTACT_PENDING})
+    assert result.extracted_fields["contact_phone"] == expected, punctuated
+
+
+def test_alternate_zero_spellings_map_to_zero():
+    from app.providers.answer import _ALL_LOCALE_DIGIT_WORDS
+
+    for word in ("ਸਿਫ਼ਰ", "ਸਿਫਰ", "பூஜ்ஜியம்", "பூஜ்யம்", "సున్నా", "శూన్యం"):
+        assert _ALL_LOCALE_DIGIT_WORDS.get(word) == "0", word
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ഇരുപത്",                      # an age word, never a phone digit
+        "ഒന്ന് രണ്ട് മൂന്ന്",              # fewer than seven digits
+        "ഇരുപത് മേയ് രണ്ടായിരത്തി ആറ്",    # a spoken date of birth
+        "ഇന്ന് തലവേദന തുടങ്ങി",          # unrelated speech
+    ],
+)
+def test_malayalam_non_phone_text_stores_no_phone(text):
+    fields = AnswerLLMProvider().interpret(
+        text, {"next_field": CONTACT_PENDING}
+    ).extracted_fields
+    assert "contact_phone" not in fields
+
+
+MALAYALAM_TRANSLITERATED_PHONE = (
+    "നൈൻ ടു ടു ഫോർ ഫോർ സീറോ സീറോ സീറോ സീറോ"
+)
+
+
+def test_malayalam_transliterated_english_digits_extract_phone():
+    # The observed browser repro: English digits spoken by a Malayalam
+    # speaker, transcribed as Malayalam-script letter names.
+    result = AnswerLLMProvider().interpret(
+        MALAYALAM_TRANSLITERATED_PHONE, {"next_field": CONTACT_PENDING}
+    )
+    # Nine spoken digits: the established minimum is 7, validation unchanged.
+    assert result.extracted_fields["contact_phone"] == "922440000"
+
+
+def test_malayalam_phone_with_vaan_three_digits_extracts_10_digits():
+    # The observed browser transcript: "nine two two four four one nine one
+    # zero three" spoken with the letter names വൺ (1) and ത്രീ (3), verified
+    # positionally against the reporter's expected 9224419103.
+    result = AnswerLLMProvider().interpret(
+        "നൈൻ ടു ടു ഫോർ ഫോർ വൺ നൈൻ വൺ സീറോ ത്രീ",
+        {"next_field": CONTACT_PENDING},
+    )
+    assert result.extracted_fields["contact_phone"] == "9224419103"
+
+
+def test_malayalam_transliterated_phone_completes_contact_capture():
+    engine = AEStateEngine.create_case("AE-phone-ml-translit")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    engine.update("patient_identifier", "Alpha Jones")
+    engine.update("patient_age", "25")
+    engine.update("consent_to_contact", True)
+    engine.update("preferred_contact_method", "phone")
+    assert engine.next_field()[0] == "contact_phone"
+    workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
+
+    result = workflow.process_turn(MALAYALAM_TRANSLITERATED_PHONE)
+
+    assert engine.case.contact_phone == "922440000"
+    assert result.next_question is not None
+    assert result.next_question[0] == "seriousness"
+
+
+def test_malayalam_phone_is_read_back_and_only_committed_explicitly():
+    # Extract -> read back -> explicit confirmation -> commit: an unconfirmed
+    # number is never written to the case.
+    from app.workflow.service.conversational import VOICE_CONFIRMATION_FIELDS
+
+    engine = AEStateEngine.create_case("AE-phone-ml-confirm")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    engine.update("patient_identifier", "Alpha Jones")
+    engine.update("patient_age", "25")
+    engine.update("consent_to_contact", True)
+    engine.update("preferred_contact_method", "phone")
+    workflow = ConversationalAEWorkflow(
+        engine, AnswerLLMProvider(), confirm_fields=VOICE_CONFIRMATION_FIELDS
+    )
+    assert engine.next_field()[0] == "contact_phone"
+
+    spoken = workflow.process_turn(
+        "നൈൻ ടു ടു ഫോർ ഫോർ വൺ നൈൻ വൺ സീറോ ത്രീ"
+    )
+    assert engine.case.contact_phone is None  # held for read-back
+    # The established phone read-back speaks only the last four digits.
+    assert "9103" in spoken.response_text
+
+    committed = workflow.process_turn("yes")
+
+    assert engine.case.contact_phone == "9224419103"
+    assert committed.next_question is not None
+    assert committed.next_question[0] == "seriousness"
+
+
+def test_malayalam_onpathu_chillu_spelling_extracts_digits_and_dob():
+    # The browser STT emitted the chillu spelling ഒൻപത് of nine (both
+    # spellings are standard Malayalam); it was unmapped, breaking the digit
+    # run in both phone answers of the observed two-turn failure.
+    from app.providers.answer import _extract_spoken_phone
+
+    t1 = "ഒൻപത് രണ്ട് രണ്ട് നാല് നാല് ഒന്ന് ഒൻപത് ഒന്ന് പൂജ്യം"
+    t2 = t1 + " മൂന്ന്"
+    # The first answer is genuinely nine digits and extracts as such; the
+    # second completes to ten.
+    assert _extract_spoken_phone(t1) == "922441910"
+    assert _extract_spoken_phone(t2) == "9224419103"
+    # The same spelling serves a spoken date of birth.
+    assert normalized_dob_in("ഒൻപത് മേയ് രണ്ടായിരം") == "09-May-2000"
+
+
+def test_two_turn_phone_repro_updates_candidate_and_confirm_commits():
+    # The exact observed two-turn sequence: the incomplete first answer
+    # extracts a shorter candidate and is read back; the corrected full
+    # spoken restatement updates the pending candidate (never committed
+    # without an explicit yes); confirming commits the 10-digit number.
+    from app.workflow.service.conversational import VOICE_CONFIRMATION_FIELDS
+
+    engine = AEStateEngine.create_case("AE-phone-ml-2turn")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    engine.update("patient_identifier", "Raju PK")
+    engine.update("patient_age", "25")
+    engine.update("consent_to_contact", True)
+    engine.update("preferred_contact_method", "phone")
+    workflow = ConversationalAEWorkflow(
+        engine, AnswerLLMProvider(), confirm_fields=VOICE_CONFIRMATION_FIELDS
+    )
+    assert engine.next_field()[0] == "contact_phone"
+
+    first = workflow.process_turn(
+        "ഒൻപത് രണ്ട് രണ്ട് നാല് നാല് ഒന്ന് ഒൻപത് ഒന്ന് പൂജ്യം"
+    )
+    assert engine.case.contact_phone is None
+    assert "1910" in first.response_text  # read back: last four digits only
+
+    corrected = workflow.process_turn(
+        "ഒൻപത് രണ്ട് രണ്ട് നാല് നാല് ഒന്ന് ഒൻപത് ഒന്ന് പൂജ്യം മൂന്ന്"
+    )
+    assert engine.case.contact_phone is None  # still unconfirmed
+    assert "9103" in corrected.response_text  # the NEW candidate read back
+
+    committed = workflow.process_turn("yes")
+
+    assert engine.case.contact_phone == "9224419103"
+    assert committed.next_question is not None
+    assert committed.next_question[0] == "seriousness"
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected_count", "expected_tail"),
+    [
+        ("9224419103", "10-digit", "9103"),
+        # The observed doubled-leading-nine artifact is now audible at
+        # confirmation time.
+        ("99224419103", "11-digit", "9103"),
+        ("922441910", "9-digit", "1910"),
+        ("9224419", "7-digit", "4419"),
+    ],
+)
+def test_phone_readback_speaks_the_digit_count_not_the_number(
+    candidate, expected_count, expected_tail
+):
+    # The privacy policy is unchanged: the number itself is never read
+    # aloud; only its digit count and the last four digits are spoken.
+    engine = AEStateEngine.create_case("AE-phone-count")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("contact_phone", candidate)
+    engine.case.pending_confirmation = "contact_phone"
+
+    question = engine.next_field()
+    assert question is not None and question[0] == "confirmation"
+    text = question[1]
+    assert f"I have a {expected_count} number ending in {expected_tail}" in text
+    # The full number is never spoken (the count and tail only).
+    assert candidate not in text or len(candidate) <= 4
+
+
+def test_unverified_malayalam_transliterations_stay_unmapped():
+    # Documented gap: വൺ/ത്രീ/ഫൈവ്/സിക്സ്/സെവൻ are not verified; runs
+    # containing them must not become a guessed phone number.
+    from app.providers.answer import _extract_spoken_phone
+
+    assert (
+        _extract_spoken_phone("വൺ ത്രീ ഫൈവ് സിക്സ് സെവൻ നൈൻ ടു ഫോർ")
+        is None
+    )
+
+
+def test_malayalam_spoken_phone_completes_contact_capture():
+    engine = AEStateEngine.create_case("AE-phone-ml")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    engine.update("patient_identifier", "Alpha Jones")
+    engine.update("patient_age", "25")
+    engine.update("consent_to_contact", True)
+    engine.update("preferred_contact_method", "phone")
+    assert engine.next_field()[0] == "contact_phone"
+    workflow = ConversationalAEWorkflow(engine, AnswerLLMProvider())
+
+    result = workflow.process_turn("പൂജ്യം ഒന്ന് രണ്ട് മൂന്ന് നാല് അഞ്ച് ആറ് ഏഴ്")
+
+    assert engine.case.contact_phone == "01234567"
+    assert result.next_question is not None
+    assert result.next_question[0] == "seriousness"
 
 
 # ---- original description preservation -------------------------------------
@@ -2162,3 +2423,853 @@ def test_date_led_statement_is_not_treated_as_a_question():
     result = AnswerLLMProvider().interpret(statement, {})
     assert result.extracted_fields.get("adverse_event") == statement
     assert result.intent == "ae_report"
+
+
+# ---- Lantus SoloStar alias recognition across the ten locales ----------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # English ASR variants (existing behaviour, pinned).
+        "I took Lantus",
+        "The lantern pen",
+        "SoloStar injection",
+        # Hindi: the existing Devanagari aliases and the observed STT
+        # variants ("लैंटर" alone, "लैंडर सोलो स्टार" via the sub-brand).
+        "मुझे लैंटस लिया था",
+        "लैंटर",
+        "लैंडर सोलो स्टार",
+        # Bengali
+        "ল্যান্টাস নিয়েছিলাম",
+        "সোলো স্টার",
+        # Gujarati
+        "મેં લાન્ટસ લીધું",
+        "લેન્ટસ",
+        "સોલો સ્ટાર",
+        # Kannada
+        "ನಾನು ಲ್ಯಾಂಟಸ್ ತೆಗೆದುಕೊಂಡೆ",
+        "ಸೋಲೋ ಸ್ಟಾರ್",
+        # Malayalam: the observed browser-test transcript stem.
+        "ലാൻഡസ്",
+        "ലാൻറസ്",
+        "ലാൻടസ്",
+        "ലാന്ടസ്",
+        "ലാന്ദസ്",
+        "ലാറ്റസ്",
+        "സോളോ സ്റ്റാർ",
+        "സോളോസ്റ്റാ",
+        "സോലോ സ്റ്റാർ",
+        "സോലോസ്റ്റാ",
+        "ഞാനെടുത്ത മരുന്നിൻ്റെ പേര് ആണ് ലാൻടസ് സോലോ സ്റ്റാർ",
+        # Marathi
+        "लँटस",
+        # Punjabi
+        "ਲੈਂਟਸ",
+        "ਸੋਲੋ ਸਟਾਰ",
+        # Tamil
+        "லான்டஸ்",
+        "லானடஸ்",
+        "சோலோ ஸ்டார்",
+        # Telugu
+        "లాంటస్",
+        "సోలో స్టార్",
+        # English: observed phonetic and spacing variants.
+        "Landus Solo Star",
+        "ZoloStar",
+        "Zolo Star",
+    ],
+)
+def test_lantus_aliases_across_all_ten_locales_canonicalize(text):
+    assert _normalize_product(text) == "Lantus SoloStar", text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "crocin",
+        "paracetamol",
+        "unknown tablet",
+        "solar star",
+        # A garbled ASR word is never aliased, alone or in context.
+        "ഞാൻ എടുത്ത മരുന്നാണ് കൊതുക",
+        "കൊതുക",
+    ],
+)
+def test_unrelated_or_garbled_medicines_never_canonicalize_to_lantus(text):
+    assert _normalize_product(text) is None, text
+
+
+# ---- unclear Indic-script replies are clarified, never captured as product ---
+
+
+# One unclear, non-medication reply per supported language (synthetic text).
+UNCLEAR_MEDICATION_REPLIES = [
+    "എഴുമല്ലേ പിന്നെ അങ്ങനെ ലഭിക്കാന് കഴിയുന്നു",
+    "കൊതുക വന്നു പോയി",
+    "ಅದು ಹೀಗೆ ಇರುತ್ತದೆ",
+    "समझ नहीं आया कैसे",
+    "এই যে",
+    "அப்படித்தான்",
+    "అలాగే ఉంది",
+    "એમ જ થયું",
+    "ਉਸ ਤਰ੍ਹਾਂ",
+]
+
+
+@pytest.mark.parametrize("text", UNCLEAR_MEDICATION_REPLIES)
+def test_unclear_indic_medication_replies_are_never_product_names(text):
+    provider = AnswerLLMProvider()
+    result = provider.interpret(
+        text,
+        {
+            "next_field": ["product", "Which medicine were you using?"],
+            "collected": {"adverse_event": "headache"},
+        },
+    )
+    assert "product" not in result.extracted_fields, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "അറിയില്ല",
+        "தெரியல",
+        "తెలియదు",
+        "ಗೊತ್ತಿಲ್ಲ",
+        "माहीत नाही",
+        "ખબર નથી",
+        "জানি না",
+        "ਪਤਾ ਨਹੀਂ",
+    ],
+)
+def test_dont_know_replies_in_new_locales_map_to_unknown_product(text):
+    provider = AnswerLLMProvider()
+    result = provider.interpret(
+        text,
+        {
+            "next_field": ["product", "Which medicine were you using?"],
+            "collected": {"adverse_event": "headache"},
+        },
+    )
+    assert (
+        result.extracted_fields.get("product") == "Unknown (to be confirmed)"
+    ), text
+
+
+def test_english_dont_know_product_reply_still_maps_to_unknown():
+    provider = AnswerLLMProvider()
+    result = provider.interpret(
+        "I don't know",
+        {
+            "next_field": ["product", "Which medicine were you using?"],
+            "collected": {"adverse_event": "headache"},
+        },
+    )
+    assert result.extracted_fields.get("product") == "Unknown (to be confirmed)"
+
+
+# ---- spoken DOB parsing in the other supported languages ----------------------
+
+from app.providers.answer import _extract_dob_date  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The observed Malayalam forms.
+        "ഇരുപത് മേയ് രണ്ടായിരം",
+        "ഇരുപത് മെയ് രണ്ടായിരം",
+        # One clear spoken date per remaining locale (20 May 2000).
+        "বিশ মে দুই হাজার",
+        "વીસ મે બે હજાર",
+        "ಇಪ್ಪತ್ತು ಮೇ ಎರಡು ಸಾವಿರ",
+        "वीस मे दोन हजार",
+        "ਵੀਹ ਮਈ ਦੋ ਹਜ਼ਾਰ",
+        "இருபது மே இரண்டு ஆயிரம்",
+        "ఇరవై మే రెండు వెయ్యి",
+        # English spoken form (existing behaviour, pinned).
+        "Twenty May Two Thousand",
+    ],
+)
+def test_spoken_dob_parses_to_20_may_2000_across_locales(text):
+    parsed, verbatim = _extract_dob_date(text)
+    assert parsed is not None, text
+    assert normalized_dob_in(text) == "20-May-2000", text
+    assert verbatim is not None, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ഇരുപത് മേയ് രണ്ടായിരത്തി അഞ്ച്",
+        "বিশ মে দুই হাজার পাঁচ",
+        "વીસ મે બે હજાર પાંચ",
+        "ಇಪ್ಪತ್ತು ಮೇ ಎರಡು ಸಾವಿರದ ಐದು",
+        "वीस मे दोन हजार पाच",
+        "ਵੀਹ ਮਈ ਦੋ ਹਜ਼ਾਰ ਪੰਜ",
+        "இருபது மே இரண்டு ஆயிரத்து ஐந்து",
+        "ఇరవై మే రెండు వెయ్యి ఐదు",
+    ],
+)
+def test_spoken_dob_year_unit_forms_parse_to_20_may_2005(text):
+    parsed, _ = _extract_dob_date(text)
+    assert parsed is not None, text
+    assert normalized_dob_in(text) == "20-May-2005", text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # STT commonly transcribes spoken numbers as digits inside an
+        # otherwise spoken date; every locale must accept the mixed forms.
+        ("ഇരുപത് മേയ് 2006", "20-May-2006"),
+        ("20 മേയ് രണ്ടായിരത്തി ആറ്", "20-May-2006"),
+        ("20 മേയ് 2006", "20-May-2006"),
+        ("पच्चीस मई 2004", "25-May-2004"),
+        ("25 मई दो हज़ार चार", "25-May-2004"),
+        ("বিশ মে 2000", "20-May-2000"),
+        ("વીસ મે 2000", "20-May-2000"),
+        ("ಇಪ್ಪತ್ತು ಮೇ 2000", "20-May-2000"),
+        ("वीस मे 2000", "20-May-2000"),
+        ("ਵੀਹ ਮਈ 2000", "20-May-2000"),
+        ("இருபது மே 2000", "20-May-2000"),
+        ("ఇరవై మే 2000", "20-May-2000"),
+    ],
+)
+def test_mixed_digit_and_spoken_dob_parses_across_locales(text, expected):
+    assert normalized_dob_in(text) == expected, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "മേയ് 2006",
+        "ഇരുപത് മേയ്",
+        "ഇരുപത് മേയ് 117",
+        "20 മേയ് 20061",
+        "पच्चीस में 2004",
+        "पच्चीस में दो हजार",
+    ],
+)
+def test_mixed_form_incomplete_dob_is_never_guessed(text):
+    assert normalized_dob_in(text) is None, text
+
+
+@pytest.mark.parametrize(
+    "month",
+    ["മേ", "മേയ്", "മെയ്"],
+)
+def test_malayalam_may_spellings_parse(month):
+    # The observed browser defect: the STT-short spelling മേ was missing
+    # while മെയ് and മേയ് were accepted.
+    assert normalized_dob_in(f"ഇരുപത് {month} രണ്ടായിരത്തി ആറ്") == "20-May-2006"
+
+
+@pytest.mark.parametrize(
+    ("day_text", "expected"),
+    [
+        # Spaced compound day forms: ASR often emits the compound with a
+        # space; without table entries, "ഇരുപത്തി രണ്ട്" silently matched the
+        # unit word alone as day 2 (02-May-2000).
+        ("ഇരുപത്തി ഒന്ന്", "21-May-2000"),
+        ("ഇരുപത്തി രണ്ട്", "22-May-2000"),
+        ("ഇരുപത്തി മൂന്ന്", "23-May-2000"),
+        ("ഇരുപത്തി നാല്", "24-May-2000"),
+        ("ഇരുപത്തി അഞ്ച്", "25-May-2000"),
+        ("ഇരുപത്തി ആറ്", "26-May-2000"),
+        ("ഇരുപത്തി ഏഴ്", "27-May-2000"),
+        ("ഇരുപത്തി എട്ട്", "28-May-2000"),
+        ("ഇരുപത്തി ഒമ്പത്", "29-May-2000"),
+        ("മുപ്പത്തി ഒന്ന്", "31-May-2000"),
+    ],
+)
+def test_malayalam_spaced_compound_days_parse(day_text, expected):
+    assert normalized_dob_in(f"{day_text} മേയ് രണ്ടായിരം") == expected
+
+
+def test_malayalam_single_day_forms_unchanged():
+    # The single-token compound and the unit-word-alone forms keep their
+    # established values.
+    assert normalized_dob_in("ഇരുപത്തിരണ്ട് മേയ് രണ്ടായിരം") == "22-May-2000"
+    assert normalized_dob_in("രണ്ട് മേയ് രണ്ടായിരം") == "02-May-2000"
+    assert normalized_dob_in("മുപ്പത് മേയ് രണ്ടായിരം") == "30-May-2000"
+
+
+def test_transliterated_english_dob_stays_unsupported():
+    # Documented gap: English number words transliterated into Malayalam
+    # script (ട്വന്റി/ടു/തൗസൻഡ്) remain unsupported until their mappings are
+    # verified by a Malayalam speaker; nothing is guessed at.
+    assert normalized_dob_in("ട്വന്റി ടു മേ ടു തൗസൻഡ് ആറ്") is None
+
+
+@pytest.mark.parametrize(
+    "month",
+    ["മേ", "മേയ്", "മെയ്"],
+)
+def test_combined_malayalam_may_spellings_name_and_dob(month):
+    text = f"എൻ്റെ പേരാണ് രാജു പി കെ ജന്മതിഥി ഇരുപത് {month} രണ്ടായിരത്തി ആറ്"
+    result = AnswerLLMProvider().interpret(
+        text, {"next_field": ["patient_identifier", "What is your name?"]}
+    )
+    assert result.extracted_fields.get("patient_age") == "20-May-2006", text
+    assert result.extracted_fields.get("patient_identifier") == "രാജു പി കെ", text
+
+
+def test_every_locale_month_token_parses_with_digit_day_and_year():
+    # Table-driven completeness: every month token in every locale table
+    # (canonical and alias spellings alike) must parse in the complete date
+    # shape, so a missing month alias can never hide again.
+    from datetime import date as _date
+
+    from app.providers.answer import _SPOKEN_DATE_TABLES, format_report_date
+
+    for table in _SPOKEN_DATE_TABLES.values():
+        for token, number in table["months"].items():
+            text = f"1 {token} 2000"
+            assert normalized_dob_in(text) == format_report_date(
+                _date(2000, number, 1)
+            ), text
+
+
+def test_every_hindi_month_token_parses_in_its_required_shape():
+    from datetime import date as _date
+
+    from app.providers.answer import (
+        _HINDI_MONTHS,
+        _HINDI_MONTH_VARIANTS,
+        format_report_date,
+    )
+
+    for token, number in _HINDI_MONTHS.items():
+        if token in _HINDI_MONTH_VARIANTS:
+            # Variant months keep their conservative shape: an exact year
+            # unit word is required; a bare digit year is never guessed.
+            text = f"1 {token} दो हजार चार"
+            expected = format_report_date(_date(2004, number, 1))
+        else:
+            text = f"1 {token} 2000"
+            expected = format_report_date(_date(2000, number, 1))
+        assert normalized_dob_in(text) == expected, text
+
+
+def test_every_english_month_token_parses():
+    from datetime import date as _date
+
+    from app.providers.answer import _MONTH_NAMES, format_report_date
+
+    for token, number in _MONTH_NAMES.items():
+        text = f"1 {token} 2000"
+        assert normalized_dob_in(text) == format_report_date(
+            _date(2000, number, 1)
+        ), text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("ഇരുപത് മാർച്ച രണ്ടായിരത്തി ആറ്", "20-Mar-2006"),
+        ("ഇരുപത് ഓഗസ്റ്റ രണ്ടായിരം", "20-Aug-2000"),
+        ("বিশ জানুয়ারী দুই হাজার", "20-Jan-2000"),
+        ("বিশ ফেব্রুয়ারী দুই হাজার", "20-Feb-2000"),
+        ("ಇಪ್ಪತ್ತು ಫೆಬ್ರುವರಿ ಎರಡು ಸಾವಿರ", "20-Feb-2000"),
+        ("ಇಪ್ಪತ್ತು ಮಾರ್ಚಿ ಎರಡು ಸಾವಿರ", "20-Mar-2000"),
+        ("ਵੀਹ ਸਿਤੰਬਰ ਦੋ ਹਜ਼ਾਰ", "20-Sep-2000"),
+        ("ਵੀਹ ਅਗਸਟ ਦੋ ਹਜ਼ਾਰ", "20-Aug-2000"),
+        ("இருபது ஆகஸ்டு இரண்டு ஆயிரம்", "20-Aug-2000"),
+        ("ఇరవై ఆగష్టు రెండు వెయ్యి", "20-Aug-2000"),
+        ("ఇరవై మార్చ్ రెండు వెయ్యి", "20-Mar-2000"),
+    ],
+)
+def test_new_month_aliases_parse_in_full_spoken_dates(text, expected):
+    assert normalized_dob_in(text) == expected, text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "32 ജനുവരി 2000",
+        "0 ജനുവരി 2000",
+        "ഇരുപത് മേ",
+        "മേ രണ്ടായിരത്തി ആറ്",
+        "30 ഫെബ്രുവരി 2000",
+        "ഇരുപത് മായ് രണ്ടായിരം",
+    ],
+)
+def test_invalid_month_day_combinations_are_never_guessed(text):
+    assert normalized_dob_in(text) is None, text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_name", "expected_dob"),
+    [
+        # The observed Malayalam contamination: the ASR variant ജന്മതിയി of
+        # the ജന്മതിഥി label (with and without the പിന്നെ connector) used to
+        # stay appended to the name. With no date spoken yet there is no DOB
+        # to extract - and none is ever invented.
+        (
+            "എൻ്റെ പേരാണ് രാജു പി കെ പിന്നെ ജന്മതിയി",
+            "രാജു പി കെ",
+            None,
+        ),
+        (
+            "എൻ്റെ പേരാണ് രാജു പി കെ ജന്മതിയി",
+            "രാജു പി കെ",
+            None,
+        ),
+        # The remaining locales' established DOB labels (the same vocabulary
+        # the workflow's which-field correction already uses) with a valid
+        # spoken date after them.
+        ("রাহুল দাস জন্ম তারিখ বিশ মে দুই হাজার", "রাহুল দাস", "20-May-2000"),
+        ("રમેશ પટેલ જન્મ તારીખ વીસ મે બે હજાર", "રમેશ પટેલ", "20-May-2000"),
+        (
+            "ರವಿ ಕುಮಾರ್ ಜನ್ಮ ದಿನಾಂಕ ಇಪ್ಪತ್ತು ಮೇ ಎರಡು ಸಾವಿರ",
+            "ರವಿ ಕುಮಾರ್",
+            "20-May-2000",
+        ),
+        ("अमोल शर्मा जन्मतारीख वीस मे दोन हजार", "अमोल शर्मा", "20-May-2000"),
+        (
+            "ਰਾਜੇਸ਼ ਕੁਮਾਰ ਜਨਮ ਤਾਰੀਖ ਵੀਹ ਮਈ ਦੋ ਹਜ਼ਾਰ",
+            "ਰਾਜੇਸ਼ ਕੁਮਾਰ",
+            "20-May-2000",
+        ),
+        (
+            "ராஜு குமார் பிறந்த தேதி இருபது மே இரண்டு ஆயிரம்",
+            "ராஜு குமார்",
+            "20-May-2000",
+        ),
+        (
+            "రాజు రెడ్డి పుట్టిన తేదీ ఇరవై మే రెండు వెయ్యి",
+            "రాజు రెడ్డి",
+            "20-May-2000",
+        ),
+    ],
+)
+def test_combined_name_and_dob_label_never_contaminates_the_name(
+    text, expected_name, expected_dob
+):
+    result = AnswerLLMProvider().interpret(
+        text, {"next_field": ["patient_identifier", "What is your name?"]}
+    )
+    assert result.extracted_fields.get("patient_identifier") == expected_name, text
+    if expected_dob is None:
+        assert "patient_age" not in result.extracted_fields, text
+    else:
+        assert normalized_dob_in(text) == expected_dob, text
+        assert result.extracted_fields.get("patient_age") == expected_dob, text
+
+
+def test_name_without_a_dob_label_stays_untouched():
+    # A plain multiword name (no DOB label present) is stored exactly as
+    # given, initials included.
+    result = AnswerLLMProvider().interpret(
+        "എൻ്റെ പേരാണ് രാജു പി കെ",
+        {"next_field": ["patient_identifier", "What is your name?"]},
+    )
+    assert result.extracted_fields.get("patient_identifier") == "രാജു പി കെ"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ഇരുപത് മേയ്",
+        "twenty may",
+        "ഇരുപത്",
+        "മേയ് രണ്ടായിരം",
+    ],
+)
+def test_incomplete_spoken_dob_is_never_guessed(text):
+    parsed, _ = _extract_dob_date(text)
+    assert parsed is None, text
+
+
+def test_combined_malayalam_name_and_dob_extract():
+    from app.providers.answer import _extract_dob_with_year
+
+
+def test_combined_malayalam_name_and_dob_extract():
+    from app.providers.answer import _extract_dob_with_year
+
+    result = AnswerLLMProvider().interpret(
+        "എന്റെ പേരാണ് രാജു വർഗീസ് ജന്മദിനം ഇരുപത് മെയ് രണ്ടായിരം",
+        {"next_field": ["patient_identifier", "What is your name?"]},
+    )
+    assert result.extracted_fields.get("patient_age") == "20-May-2000"
+    assert result.extracted_fields.get("patient_identifier") == "രാജു വർഗീസ്"
+    dob_value, _year = _extract_dob_with_year(
+        "എന്റെ പേരാണ് രാജു വർഗീസ് ജന്മദിനം ഇരുപത് മെയ് രണ്ടായിരം"
+    )
+    # `_extract_dob_with_year` returns the verbatim span (not the normalized
+    # date) — that span is what later name-splitting removes.
+    assert dob_value == "ഇരുപത് മെയ് രണ്ടായിരം"
+
+
+def test_combined_english_name_and_spoken_dob_extract():
+    # The observed failure: the greedy spoken-DOB day group swallowed the
+    # lead-in word ("… is twenty May two thousand" first matched with day
+    # "is twenty"), so the combined answer parsed neither value. The search
+    # now retries overlapping candidates, and the name cleanup then removes
+    # the DOB phrase ("and my date of birth is twenty May two thousand").
+    for name in ("Raju", "Raju PK"):
+        text = f"My name is {name} and my date of birth is twenty May two thousand"
+        parsed, verbatim = _extract_dob_date(text)
+        assert parsed is not None, text
+        assert normalized_dob_in(text) == "20-May-2000", text
+        assert verbatim == "twenty May two thousand", text
+        result = AnswerLLMProvider().interpret(
+            text, {"next_field": ["patient_identifier", "What is your name?"]}
+        )
+        assert result.extracted_fields.get("patient_age") == "20-May-2000", text
+        assert result.extracted_fields.get("patient_identifier") == name, text
+
+# ---- mixed alphabets and digits in phone capture (reported live failure) -----
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        # Spoken words mixed with literal digits: every digit survives in
+        # order, including repeats.
+        ("nine 2 2 four four one nine one zero three", "9224419103"),
+        ("nine two two 4 4 one nine one zero three", "9224419103"),
+        # All-literal spaced digits, including a leading zero.
+        ("9 2 2 4 4 1 9 1 0 3", "9224419103"),
+        ("0 9 8 8 6 0 9 4 3 2 1", "09886094321"),
+        # Native-script digit glyphs (Devanagari ०-९).
+        ("८२२४४१८१०३", "8224418103"),
+    ],
+)
+def test_mixed_digits_and_digit_words_extract_phone(transcript, expected):
+    from app.providers.answer import _extract_spoken_phone
+
+    assert _extract_spoken_phone(transcript) == expected
+
+
+def test_mixed_script_name_wrappers_are_stripped():
+    # "माझं नाव Raju Patil आहे" -> "Raju Patil": the Marathi possessive
+    # lead and the trailing copula are never part of the name, while every
+    # Latin and native-script letter of the name itself is preserved.
+    result = AnswerLLMProvider().interpret(
+        "माझं नाव Raju Patil आहे",
+        {"next_field": ["patient_identifier", "What is your name?"]},
+    )
+    assert result.extracted_fields.get("patient_identifier") == "Raju Patil"
+
+
+def test_mixed_marathi_name_and_dob_extract_into_separate_fields():
+    # The reported browser sentence: "माझं नाव राजू के आणि माझा जन्मतारीख
+    # वीस जुलै दोन हजार" — the DOB-label tail (with its "आणि माझा"
+    # conjunction and possessive lead) is never part of the name, so the
+    # two fields extract separately and cleanly.
+    result = AnswerLLMProvider().interpret(
+        "माझं नाव राजू के "
+        "आणि माझा जन्मतारीख "
+        "वीस जुलै दोन हजार",
+        {"next_field": ["patient_identifier", "What is your name?"]},
+    )
+    assert result.extracted_fields.get("patient_identifier") == "राजू के"
+    assert result.extracted_fields.get("patient_age") == "20-Jul-2000"
+
+
+# ---- Marathi transliterated phone + month-first Marathi name/DOB --------------
+
+
+def test_devanagari_asr_spelling_variants_extract_phone():
+    # The reported Marathi transcript: "नाईन टू टू फोर फोर वन नाईन झीरो
+    # झीरो वन" — the ि/ी matra spelling of nine and the झ spelling of
+    # zero must map exactly as their established variants do.
+    from app.providers.answer import _extract_spoken_phone
+
+    assert _extract_spoken_phone(
+        "नाईन टू टू फोर फोर "
+        "वन नाईन झीरो झीरो वन"
+    ) == "9224419001"
+    assert _extract_spoken_phone(
+        "nine two two four four one nine zero zero one"
+    ) == "9224419001"
+
+
+def test_incomplete_transliterated_number_is_never_converted():
+    from app.providers.answer import _extract_spoken_phone
+
+    # Three spoken digits: below the established minimum, nothing is
+    # invented and nothing is returned.
+    assert _extract_spoken_phone(
+        "नाईन टू टू"
+    ) is None
+
+
+def test_marathi_name_lead_variants_and_month_first_dob():
+    # The reported browser sentence: the masculine-possessive "माझा नाव"
+    # lead must strip exactly like "माझं/माझे नाव", and the Marathi
+    # month-first DOB order ("<month> <day> <year>") must yield the same
+    # normalized date as the day-first order.
+    from app.providers.answer import _clean_name_value
+
+    assert _clean_name_value(
+        "माझा नाव राजू के"
+    ) == "राजू के"
+
+    month_first = "माझा नाव राजू के "
+    month_first += "आणि माझा जन्मतारीख "
+    month_first += "जुलै वीस दोन हजार"
+    result = AnswerLLMProvider().interpret(
+        month_first, {"next_field": ["patient_identifier", "name and dob?"]}
+    )
+    assert result.extracted_fields.get("patient_identifier") == "राजू के"
+    assert result.extracted_fields.get("patient_age") == "20-Jul-2000"
+
+    # A name that merely contains a conjunction-shaped word is never
+    # blindly truncated: without a DOB label the whole value is the name.
+    full_name = AnswerLLMProvider().interpret(
+        "राजू आणि सुनीता",
+        {"next_field": ["patient_identifier", "What is your name?"]},
+    )
+    assert (
+        full_name.extracted_fields.get("patient_identifier")
+        == "राजू आणि सुनीता"
+    )
+
+
+# ---- phone length plausibility (reported 11-digit acceptance) -----------------
+
+
+def test_marathi_eleven_digit_dictation_is_not_captured():
+    # The reported transcript: "नऊ दोन दोन चार चार एक नऊ शून्य शून्य एक
+    # शून्य" → an 11-digit run (a doubled digit or an extra word). The raw
+    # run is still extracted faithfully, but it is never captured as a
+    # candidate: the workflow asks for the number again (digit by digit,
+    # bounded) instead of offering an implausible number for confirmation.
+    from app.providers.answer import _extract_spoken_phone
+
+    transcript = (
+        "नऊ दोन दोन चार चार "
+        "एक नऊ शून्य शून्य "
+        "एक शून्य"
+    )
+    assert _extract_spoken_phone(transcript) == "92244190010"  # faithful run
+
+    engine = AEStateEngine.create_case("AE-phone-11-gate")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    engine.update("patient_identifier", "Raju P K")
+    engine.update("patient_age", "25")
+    engine.update("consent_to_contact", True)
+    engine.update("preferred_contact_method", "phone")
+    workflow = ConversationalAEWorkflow(
+        engine, AnswerLLMProvider(), confirm_fields=VOICE_CONFIRMATION_FIELDS
+    )
+    result = workflow.process_turn(transcript)
+
+    assert engine.case.contact_phone is None
+    assert engine.case.confirmation_candidate == {}
+    assert result.next_question is not None
+    assert result.next_question[0] == "contact_phone"
+
+
+@pytest.mark.parametrize(
+    ("run", "plausible"),
+    [
+        ("9224419001", True),      # 10 digits
+        ("922441900", True),       # 9 digits
+        ("09886094321", True),     # 11 digits with a leading zero (STD form)
+        ("92244190010", False),    # 11 digits without a leading zero
+        ("922441", False),         # below the established minimum
+    ],
+)
+def test_phone_length_plausibility(run, plausible):
+    from app.providers.answer import _is_plausible_phone
+
+    assert _is_plausible_phone(run) is plausible
+
+
+def test_implausible_pending_phone_never_commits_on_confirmation():
+    # An explicit confirmation of a read-back is not successful number
+    # validation: a directly-seeded implausible candidate cannot be
+    # committed by a bare "yes" — the number is asked for again instead.
+    engine = AEStateEngine.create_case("AE-phone-11-commit-gate")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    engine.update("patient_identifier", "Raju P K")
+    engine.update("patient_age", "25")
+    engine.update("consent_to_contact", True)
+    engine.update("preferred_contact_method", "phone")
+    engine.case.pending_confirmation = "contact_phone"
+    engine.case.confirmation_candidate = {"contact_phone": "92244190010"}
+    workflow = ConversationalAEWorkflow(
+        engine, AnswerLLMProvider(), confirm_fields=VOICE_CONFIRMATION_FIELDS
+    )
+
+    result = workflow.process_turn("yes")
+
+    assert engine.case.contact_phone is None
+    assert engine.case.pending_confirmation == "contact_phone"
+    assert result.completed is False
+
+
+def test_leading_zero_phone_confirms_and_commits():
+    # The STD-prefixed form stays plausible end to end, and the committed
+    # value preserves the leading zero exactly.
+    engine = AEStateEngine.create_case("AE-phone-std")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    engine.update("patient_identifier", "Raju P K")
+    engine.update("patient_age", "25")
+    engine.update("consent_to_contact", True)
+    engine.update("preferred_contact_method", "phone")
+    workflow = ConversationalAEWorkflow(
+        engine, AnswerLLMProvider(), confirm_fields=VOICE_CONFIRMATION_FIELDS
+    )
+    readback = workflow.process_turn("शून्य नऊ दोन दोन चार चार एक नऊ शून्य शून्य")
+    assert engine.case.confirmation_candidate["contact_phone"] == "0922441900"
+
+    committed = workflow.process_turn("yes")
+
+    assert engine.case.contact_phone == "0922441900"
+    assert "00" in readback.response_text  # the tail is spoken for review
+
+
+# ---- ambiguous Hindi date attempt keeps the name clean (reported failure) ----
+
+
+def test_failed_hindi_date_attempt_never_contaminates_the_name():
+    # The reported live failure: "राजू शर्मा बीस में दो हजार" — the month
+    # word was misrecognised ("में" for "मई"), so the date cannot parse.
+    # The day-word + year-lead tail is a failed date attempt: it is
+    # stripped from the name candidate, and the DOB stays unset for a
+    # bounded clarification — nothing is invented.
+    result = AnswerLLMProvider().interpret(
+        "राजू शर्मा बीस में दो हजार",
+        {"next_field": ["patient_identifier", "name and dob?"]},
+    )
+    assert result.extracted_fields.get("patient_identifier") == "राजू शर्मा"
+    assert "patient_age" not in result.extracted_fields
+
+    # The DOB retry of the same ambiguous phrase stays unparseable: no
+    # date is invented from it.
+    retry = AnswerLLMProvider().interpret(
+        "बीस में दो हजार",
+        {"next_field": ["patient_age", "What is your date of birth?"]},
+    )
+    assert "patient_age" not in retry.extracted_fields
+
+
+def test_clear_hindi_name_and_dob_still_extract_together():
+    # The clean spelling (मई = May) parses normally: both fields extract
+    # separately from the same sentence.
+    result = AnswerLLMProvider().interpret(
+        "राजू शर्मा बीस मई दो हजार",
+        {"next_field": ["patient_identifier", "name and dob?"]},
+    )
+    assert result.extracted_fields.get("patient_identifier") == "राजू शर्मा"
+    assert result.extracted_fields.get("patient_age") == "20-May-2000"
+
+
+def test_workflow_keeps_name_and_reasks_dob_after_a_failed_date():
+    # Workflow level: the ambiguous answer keeps the held name candidate
+    # clean and the pending DOB question is re-asked for clarification.
+    from app.workflow.ae_engine import AEStateEngine
+    from app.workflow.service.conversational import (
+        ConversationalAEWorkflow,
+        VOICE_CONFIRMATION_FIELDS,
+    )
+
+    engine = AEStateEngine.create_case("AE-ambiguous-dob")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    workflow = ConversationalAEWorkflow(
+        engine, AnswerLLMProvider(), confirm_fields=VOICE_CONFIRMATION_FIELDS
+    )
+    workflow.process_turn(
+        "राजू शर्मा बीस में दो हजार"
+    )
+    assert engine.case.patient_identifier is None  # held for the read-back
+    assert engine.case.confirmation_candidate["patient_identifier"] == (
+        "राजू शर्मा"
+    )
+    assert engine.case.patient_age is None
+
+
+# ---- English name capitalization (structured-field normalization) ------------
+
+
+def test_latin_name_words_are_capitalized_in_the_structured_field():
+    # The reported display issue: a lower-case spoken English name is
+    # capitalized per word in the STRUCTURED field (the confirmation
+    # candidate, the read-back and the report show the capitalized form);
+    # the provider layer keeps the cleaned raw wording and the raw
+    # transcript is never touched.
+    result = AnswerLLMProvider().interpret(
+        "raju sharma", {"next_field": ["patient_identifier", "What is your name?"]}
+    )
+    assert result.extracted_fields.get("patient_identifier") == "raju sharma"
+
+    engine = AEStateEngine.create_case("AE-titlecase-name")
+    engine.update("patient_identifier", "raju sharma")
+    assert engine.case.patient_identifier == "Raju Sharma"
+
+    engine2 = AEStateEngine.create_case("AE-titlecase-confirm")
+    engine2.begin_confirmation("patient_identifier", "raju sharma")
+    assert engine2.case.confirmation_candidate["patient_identifier"] == "Raju Sharma"
+
+
+def test_internal_capitalization_and_native_script_are_preserved():
+    from app.providers.answer import _clean_name_value
+
+    # Meaningful internal capitalization is never rewritten.
+    assert _clean_name_value("Eric McDonald") == "Eric McDonald"
+    assert _clean_name_value("McDonald") == "McDonald"
+    # The engine's structured value keeps internal caps and non-Latin
+    # scripts byte-for-byte (no case mapping exists for them).
+    engine = AEStateEngine.create_case("AE-titlecase-mixed")
+    engine.update("patient_identifier", "Eric McDonald")
+    assert engine.case.patient_identifier == "Eric McDonald"
+    engine2 = AEStateEngine.create_case("AE-titlecase-deva")
+    native = "राजू शर्मा"
+    engine2.update("patient_identifier", native)
+    assert engine2.case.patient_identifier == native
+
+
+def test_reported_nukta_spelling_name_preserved_dob_unset():
+    # The exact reported turn-4 transcript (the nukta spelling हज़ार): the
+    # name candidate stays राजू करम and no date is invented.
+    result = AnswerLLMProvider().interpret(
+        "राजू करम बीस मे "
+        "दो हज़ार",
+        {"next_field": ["patient_identifier", "name and dob?"]},
+    )
+    assert result.extracted_fields.get("patient_identifier") == "राजू करम"
+    assert "patient_age" not in result.extracted_fields
+
+
+def test_failed_dob_attempt_shape_detector():
+    from app.providers.answer import _ends_with_failed_date_attempt
+
+    # The recognizable unparseable shape (day word + में + year lead).
+    assert _ends_with_failed_date_attempt(
+        "बीस में दो हजार"
+    ) is True
+    # A parseable date is not a failed attempt.
+    assert _ends_with_failed_date_attempt(
+        "बीस मई दो हजार"
+    ) is False
+    # An unrelated name/utterance never matches.
+    assert _ends_with_failed_date_attempt("राजू शर्मा") is False
+
+
+def test_hindi_at_rate_spelling_extracts_email():
+    # The reported Hindi transcript: the at-rate cue without the candrabindu
+    # ("एट द रेट") must extract exactly like the Marathi spelling.
+    from app.providers.answer import _normalize_spoken_email
+
+    hindi = "एस आर ई ई एच एट द रेट जीमेल डॉट कॉम"
+    marathi = "एस आर ई ई एच अॅट द रेट जीमेल डॉट कॉम"
+    assert _normalize_spoken_email(hindi) == "sreeh@gmail.com"
+    assert _normalize_spoken_email(marathi) == "sreeh@gmail.com"
+    # The Malayalam and Latin spellings are covered by the existing
+    # dictation-variant tests (test_all_three_sreehari_dictation_variants_parse).
+    assert _normalize_spoken_email("S R E E H at the rate gmail dot com") == "sreeh@gmail.com"

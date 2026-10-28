@@ -145,6 +145,12 @@ export function useWavRecorder({
         return false;
       }
       const context = new AudioContextCtor();
+      // Auto-started recording (after the greeting finishes) has no user
+      // gesture behind it, where browsers create the context suspended —
+      // resume so the processor actually captures audio instead of silence.
+      if (context.state === "suspended") {
+        await context.resume();
+      }
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
       // Route through a muted gain node so the processor runs without

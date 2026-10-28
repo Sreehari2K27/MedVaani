@@ -133,11 +133,21 @@ _DAYS_AGO = re.compile(
 _DAY_BEFORE_YESTERDAY = re.compile(r"\bday\s+before\s+yesterday\b", re.IGNORECASE)
 _YESTERDAY = re.compile(r"\byesterday\b", re.IGNORECASE)
 _TODAY = re.compile(
-    r"\b(today|tonight|this\s+(?:morning|afternoon|evening))\b", re.IGNORECASE
+    r"\b(today|tonight|this\s+(?:morning|afternoon|evening))\b"
+    # Malayalam relative today (bare Indic tokens; a trailing \b never
+    # matches after a matra): "ഇന്നു രാവിലെ" = this morning.
+    r"|ഇന്നു|ഇന്ന്"
+    # Hindi relative today (the observed "आज सुबह" live wording), following the Malayalam bare-Indic-token precedent; no clock time is ever inferred.
+    r"|आज",
+    re.IGNORECASE,
 )
 _PERIOD = re.compile(
     r"\b(?:this\s+)?(morning|afternoon|evening|night|midnight|noon|midday)\b"
-    r"|\btonight\b",
+    r"|\btonight\b"
+    # Malayalam morning ("രാവിലെ"), bare like the other Indic tokens.
+    r"|രാവിലെ"
+    # Hindi morning ("subah"), bare like the Malayalam token: "आज सुबह" = today morning.
+    r"|सुबह",
     re.IGNORECASE,
 )
 
@@ -205,6 +215,31 @@ def resolve_reference(
     return instant
 
 
+def is_recognizable_onset(statement: str | None) -> bool:
+    """Whether the statement contains a recognizable date or time expression:
+    an explicit supported date, a relative-day expression (today/yesterday/
+    N days ago, including the supported native-script tokens), or a period
+    word (morning/afternoon/… ). Used to gate onset capture so
+    acknowledgements and non-date answers are never stored as onset dates.
+    Recognition only - the actual value still resolves against the
+    conversation's own reference, and no clock time is ever invented."""
+    text = (statement or "").strip()
+    if not text:
+        return False
+    if _parse_explicit_date(text) is not None:
+        return True
+    # The relative SHAPE is recognizable without a real reference date; the
+    # stored value still resolves from the conversation's own reference.
+    if (
+        _DAY_BEFORE_YESTERDAY.search(text)
+        or _YESTERDAY.search(text)
+        or _DAYS_AGO.search(text)
+        or _TODAY.search(text)
+    ):
+        return True
+    return _PERIOD.search(text) is not None
+
+
 def normalize_onset_statement(
     statement: str | None,
     reference: datetime | None = None,
@@ -255,12 +290,27 @@ def _parse_timezone(value: str | None):
         return None
 
 
+_PERIOD_TRANSLATIONS: dict[str, str] = {
+    # Malayalam morning (the established catalog token) and the Hindi
+    # subah spoken by the code-switching reporters in the observed
+    # live transcripts; both normalize to the English value the
+    # workflow stores.
+    "രാവിലെ": "morning",
+    "सुबह": "morning",
+}
+
+
 def _extract_period(text: str) -> str | None:
     match = _PERIOD.search(text)
     if match is None:
         return None
     if match.group(1):
         return match.group(1).lower()
+    # Bare Indic matches have no captured group: translate the matched word
+    # when known; "tonight" and unknown words keep the existing day-part.
+    matched = match.group(0).strip().lower()
+    if matched in _PERIOD_TRANSLATIONS:
+        return _PERIOD_TRANSLATIONS[matched]
     return "night"
 
 

@@ -152,7 +152,6 @@
 }
 
 .ae-card--voice {
-  padding: 3.5rem;
   background: linear-gradient(135deg, #ffffff 0%, #f5f2ff 48%, #fff1ea 100%);
   box-shadow: 0 28px 60px rgba(99, 102, 241, 0.14);
 }
@@ -196,8 +195,10 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 5.5rem;
-  height: 5.5rem;
+  /* Same container dimensions and icon size as .ae-mic so both landing
+     cards are visually balanced; only the treatment (colors/shape) differs. */
+  width: 7.25rem;
+  height: 7.25rem;
   border-radius: 1.75rem;
   color: #4f46e5;
   background: linear-gradient(135deg, #e3e0ff 0%, #eef0ff 100%);
@@ -207,8 +208,8 @@
 }
 
 .ae-chat-icon svg {
-  width: 2.5rem;
-  height: 2.5rem;
+  width: 2.75rem;
+  height: 2.75rem;
 }
 
 .ae-card-body {
@@ -224,18 +225,10 @@
   color: #0f1b2b;
 }
 
-.ae-card--voice .ae-card-title {
-  font-size: 2.1rem;
-}
-
 .ae-card-desc {
   font-size: 1.15rem;
   line-height: 1.65;
   color: #64748b;
-}
-
-.ae-card--voice .ae-card-desc {
-  font-size: 1.2rem;
 }
 
 .ae-cta {
@@ -697,6 +690,56 @@
   color: #b4553f;
 }
 
+/* Voice-first startup controls: greeting loading, autoplay blocked,
+   greeting unavailable, microphone permission denied. */
+.ae-voice-start {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin: 0 0 0.6rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid #dbe3f0;
+  border-radius: 0.9rem;
+  background: #f7f9fc;
+  font-size: 0.875rem;
+  color: #33405a;
+}
+
+.ae-voice-start--loading {
+  justify-content: center;
+  color: #64748b;
+}
+
+.ae-voice-start-text {
+  flex: 1;
+}
+
+.ae-voice-start-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.55rem 0.9rem;
+  border: 0;
+  border-radius: 0.7rem;
+  background: #0f1b2b;
+  color: #ffffff;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.18s ease;
+}
+
+.ae-voice-start-btn:hover {
+  background: #1e293b;
+}
+
+.ae-voice-start-btn:focus-visible {
+  outline: 2px solid #6366f1;
+  outline-offset: 2px;
+}
+
 /* ---------------- safety + disclaimer ---------------- */
 
 .ae-convo-safety {
@@ -1048,19 +1091,10 @@
     gap: 1.25rem;
   }
 
-  .ae-card--voice {
-    padding: 2.25rem;
-  }
-
-  .ae-card--voice .ae-card-title {
-    font-size: 1.65rem;
-  }
-
   .ae-card-title {
     font-size: 1.45rem;
   }
 
-  .ae-card--voice .ae-card-desc,
   .ae-card-desc {
     font-size: 1.0625rem;
   }
@@ -1080,14 +1114,14 @@
   }
 
   .ae-chat-icon {
-    width: 4.75rem;
-    height: 4.75rem;
+    width: 5.75rem;
+    height: 5.75rem;
     border-radius: 1.5rem;
   }
 
   .ae-chat-icon svg {
-    width: 2.1rem;
-    height: 2.1rem;
+    width: 2.25rem;
+    height: 2.25rem;
   }
 
   .ae-cta {
@@ -1169,4 +1203,33 @@
   .ae-summary-card {
     padding: 1.25rem 1.1rem;
   }
+}
+
+/* Explicit report-language selector (initial backend hint). */
+.ae-lang-picker {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.ae-lang-picker-label {
+  font-size: 0.78rem;
+  color: #5b6472;
+}
+
+.ae-lang-picker-select {
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 4px 8px;
+  border: 1px solid #d7dce3;
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+}
+
+.ae-lang-picker-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
 }

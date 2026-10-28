@@ -74,8 +74,8 @@ function AeEntry({ onStartChat, onStartVoice }: AeEntryProps) {
           >
             <span className="ae-chat-icon" aria-hidden="true">
               <svg
-                width="40"
-                height="40"
+                width="44"
+                height="44"
                 viewBox="0 0 24 24"
                 fill="none"
                 stroke="currentColor"

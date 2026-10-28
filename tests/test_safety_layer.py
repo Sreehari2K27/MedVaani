@@ -516,3 +516,143 @@ def test_negated_hindi_death_phrases_do_not_escalate():
         assert result.signal != SafetySignal.URGENT_LIFE_THREATENING, text
         assert result.should_interrupt_ae is False, text
         assert result.mark_high_priority is False, text
+
+
+# ---- urgent-symptom vocabulary for the eight additional languages -------------
+# Each entry covers the audit's core categories: breathing difficulty, heart
+# attack and unconsciousness, using high-confidence synthetic phrases.
+
+
+_MULTILINGUAL_URGENT_PHRASES = {
+    "bn-IN": (
+        "আমার খুব শ্বাস নিতে কষ্ট হচ্ছে",
+        "ওর হার্ট অ্যাটাক হয়েছে",
+        "রোগী অজ্ঞান হয়ে আছে",
+    ),
+    "gu-IN": (
+        "મને શ્વાસ લેવામાં તકલીફ થઈ રહી છે",
+        "તેમને હાર્ટ એટેક આવ્યો",
+        "દર્દી બેભાન છે",
+    ),
+    "kn-IN": (
+        "ನನಗೆ ಉಸಿರಾಡಲು ಕಷ್ಟವಾಗುತ್ತಿದೆ",
+        "ಅವರಿಗೆ ಹೃದಯಾಘಾತವಾಯಿತು",
+        "ರೋಗಿ ಮೂರ್ಛೆಯಲ್ಲಿದ್ದಾರೆ",
+    ),
+    "ml-IN": (
+        "എനിക്ക് ശ്വാസം കിട്ടാതെ ഉള്ളൂ",
+        "അദ്ദേഹത്തിന് ഹൃദയാഘാതം വന്നു",
+        "രോഗി ബോധരഹിതനാണ്",
+    ),
+    "mr-IN": (
+        "मला श्वास घेण्यास त्रास होत आहे",
+        "त्यांना हृदयविकाराचा झटका आला",
+        "रुग्ण बेशुद्ध आहे",
+    ),
+    "pa-IN": (
+        "ਮੈਨੂੰ ਸਾਹ ਲੈਣ ਵਿੱਚ ਤਕਲੀਫ਼ ਹੈ",
+        "ਉਸਨੂੰ ਦਿਲ ਦਾ ਦੌਰਾ ਪਿਆ",
+        "ਮਰੀਜ਼ ਬੇਹੋਸ਼ ਹੈ",
+    ),
+    "ta-IN": (
+        # The audit finding: this phrase must escalate as urgent.
+        "எனக்கு மூச்சு விட முடியவில்லை",
+        "அவருக்கு மாரடைப்பு ஏற்பட்டது",
+        "நோயாளி மயக்கமாக இருக்கிறார்",
+    ),
+    "te-IN": (
+        "నాకు ఊపిరి ఆడకపోవుతోంది",
+        "అతనికి గుండెపోటు వచ్చింది",
+        "రోగి స్పృహ లేకుండా ఉన్నారు",
+    ),
+}
+
+
+def test_urgent_phrases_in_all_eight_new_languages_escalate():
+    for language, phrases in _MULTILINGUAL_URGENT_PHRASES.items():
+        for text in phrases:
+            result = SafetyLayer.classify_input(text)
+            assert result.signal == SafetySignal.URGENT_LIFE_THREATENING, (
+                f"{language}: {text}"
+            )
+            assert result.should_interrupt_ae is True, f"{language}: {text}"
+            assert result.escalate_to_human_review is True, f"{language}: {text}"
+            assert result.mark_high_priority is True, f"{language}: {text}"
+            assert result.preserve_case_info is True, f"{language}: {text}"
+
+
+def test_negated_urgent_phrases_in_new_languages_do_not_escalate():
+    # Head-final negation ("... নেই", "... లేదు", "... இல்லை", "... ਨਹੀਂ")
+    # reuses the existing after-match window, mirroring the Hindi behaviour.
+    for text in (
+        "ওর হার্ট অ্যাটাক নেই",
+        "মারা গেছে না",
+        "તેમને હાર્ટ એટેક નથી આવ્યો",
+        "ಅವರಿಗೆ ಹೃದಯಾಘಾತ ಇಲ್ಲ",
+        "അദ്ദേഹത്തിന് ഹൃദയാഘാതം ഇല്ല",
+        "त्यांना पक्षाघात नाही",
+        "ਉਸਨੂੰ ਦਿਲ ਦਾ ਦੌਰਾ ਨਹੀਂ ਪਿਆ",
+        "அவருக்கு மாரடைப்பு இல்லை",
+        "అతనికి గుండెపోటు లేదు",
+    ):
+        result = SafetyLayer.classify_input(text)
+        assert result.signal != SafetySignal.URGENT_LIFE_THREATENING, text
+        assert result.should_interrupt_ae is False, text
+        assert result.escalate_to_human_review is False, text
+        assert result.mark_high_priority is False, text
+
+
+def test_severe_abdominal_pain_in_new_languages_escalates():
+    for text in (
+        "வயிற்றில் கடும் வலி",
+        "కడుపులో తీవ్ర నొప్పి",
+        "ಹೊಟ್ಟೆಯಲ್ಲಿ ತೀವ್ರ ನೋವು",
+        "വയറിൽ കടുത്ത വേദന",
+        "पोटात जोरदार दुखण",
+        "પેટમાં ભારે દુખાવો",
+        "পেটে প্রচণ্ড ব্যথা",
+        "ਪੇਟ ਵਿੱਚ ਬਹੁਤ ਦਰਦ",
+    ):
+        result = SafetyLayer.classify_input(text)
+        assert result.signal == SafetySignal.URGENT_LIFE_THREATENING, text
+        assert result.mark_high_priority is True, text
+
+
+def test_mild_abdominal_pain_in_new_languages_is_not_urgent():
+    # Severity is mandatory in every language: bare stomach-pain mentions
+    # without a severity word never escalate.
+    for text in (
+        "வயிற்று வலி",
+        "కడుపు నొప్పి",
+        "ಹೊಟ್ಟೆ ನೋವು",
+        "വയറുവേദന",
+        "पोटदुखी",
+        "પેટનો દુખાવો",
+        "পেট ব্যথা",
+        "ਪੇਟ ਦਰਦ",
+    ):
+        result = SafetyLayer.classify_input(text)
+        assert result.signal != SafetySignal.URGENT_LIFE_THREATENING, text
+        assert result.should_interrupt_ae is False, text
+        assert result.mark_high_priority is False, text
+
+
+def test_urgent_tamil_phrase_escalates_workflow_and_preserves_event_description():
+    from app.providers.mock import MockLLMProvider
+    from app.workflow.service.conversational import ConversationalAEWorkflow
+
+    engine = AEStateEngine.create_case("AE-safety-tamil-urgent-demo")
+    wf = ConversationalAEWorkflow(engine, MockLLMProvider())
+    first = wf.process_turn("I took Lantus and have a headache.")
+    assert first.safety_status == "ok"
+    original = engine.case.adverse_event
+    assert original
+
+    urgent = wf.process_turn("எனக்கு மூச்சு விட முடியவில்லை")
+    assert urgent.safety_status == "urgent_life_threatening"
+    assert urgent.human_review_required is True
+    assert urgent.priority == "high"
+    assert urgent.current_state == "HUMAN_REVIEW"
+    # The original description is preserved; the urgent statement is appended.
+    assert original in engine.case.adverse_event
+    assert "மூச்சு விட முடியவில்லை" in engine.case.adverse_event

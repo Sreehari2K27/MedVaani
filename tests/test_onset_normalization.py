@@ -104,6 +104,25 @@ def test_relative_dates_anchor_to_the_conversation_timestamp():
         assert result.period is None  # no clock time is ever invented
 
 
+def test_malayalam_relative_today_morning_resolves_with_a_reference():
+    # The observed browser phrase: "ഇന്നു രാവിലെ" = this morning; both
+    # spellings of today resolve against the local reference date, and the
+    # period normalizes to the English "morning" value.
+    for statement in ("ഇന്നു രാവിലെ", "ഇന്ന് രാവിലെ"):
+        result = normalize_onset_statement(statement, FIXED_REFERENCE)
+        assert result.normalized_iso == "2026-10-09", statement
+        assert result.period == "morning", statement
+        assert result.source == "normalized", statement
+
+
+def test_malayalam_relative_without_a_reference_stays_unknown_and_verbatim():
+    result = normalize_onset_statement("ഇന്നു രാവിലെ", None)
+    assert result.normalized_iso is None
+    assert result.source == "unknown"
+    # The original wording is retained exactly as reported for review.
+    assert result.original == "ഇന്നു രാവിലെ"
+
+
 @pytest.mark.parametrize(
     "statement",
     [
@@ -427,7 +446,14 @@ def test_voice_endpoint_threads_stt_timestamp_into_onset_display():
     assert "I heard" not in onset_turn["response_text"]
 
 
-def test_voice_endpoint_without_timestamp_keeps_original_wording():
+def test_voice_endpoint_without_valid_frame_uses_the_aware_receipt_time():
+    # With no STT timestamp (or a naive one), the voice endpoint follows the
+    # text conversation's established receipt-time rule: the server's aware
+    # receipt time is the conversation frame; a naive instant is never
+    # assigned a guessed timezone nor treated as UTC. The reporter's wording
+    # is still kept byte for byte.
+    from datetime import datetime as datetime_mod
+
     client = _build_client(_script_to_onset(), None)
     session_id = "onset-endpoint-no-ts"
     for _ in range(11):
@@ -436,5 +462,108 @@ def test_voice_endpoint_without_timestamp_keeps_original_wording():
 
     collected = onset_turn["ae"]["collected_information"]
     assert collected["onset_date"] == "It started this morning"
-    assert collected["onset_date_display"] is None
-    assert collected["onset_date_source"] == "unknown"
+    expected_receipt_date = format_iso_date(
+        datetime_mod.now().astimezone().date().isoformat()
+    )
+    assert collected["onset_date_display"] == expected_receipt_date
+    assert collected["onset_date_source"] == "normalized"
+    assert collected["onset_period"] == "morning"
+
+
+def test_voice_endpoint_gnani_timestamp_prefers_aware_receipt_frame(monkeypatch):
+    # Gnani's underscored naive timestamp (fixture format, tests/test_prisma.py:74)
+    # is not a reliable local frame: the endpoint falls back to the
+    # controlled aware receipt time below and never treats the naive
+    # instant as UTC or assigns a guessed timezone to it.
+    import app.api.voice_conversation as vc
+
+    fixed = datetime.fromisoformat(
+        "2026-10-23T09:00:00+05:30"
+    )
+
+    class FixedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr(vc, "datetime", FixedClock)
+
+    client = _build_client(_script_to_onset(), "20251226_143052.123")
+    session_id = "onset-endpoint-gnani-ts"
+    for _ in range(11):
+        _turn(client, session_id)
+    onset_turn = _turn(client, session_id)
+
+    collected = onset_turn["ae"]["collected_information"]
+    assert collected["onset_date"] == "It started this morning"
+    assert collected["onset_date_display"] == format_iso_date("2026-10-23")
+    assert collected["onset_period"] == "morning"
+    assert collected["onset_date_source"] == "normalized"
+
+
+def test_hindi_today_morning_resolves_from_the_reference():
+    # "आज सुबह" ("today morning", Hindi words spoken in a Marathi session):
+    # the date resolves from the conversation reference and the morning
+    # period is recorded - no clock time is ever invented, and the original
+    # wording is preserved verbatim.
+    import datetime
+
+    result = normalize_onset_statement(
+        "आज सुबह",
+        reference=datetime.datetime(2026, 10, 27, 9, 0),
+    )
+    assert result.normalized_iso == "2026-10-27"
+    assert result.period == "morning"
+    assert result.source == "normalized"
+    assert result.original == "आज सुबह"
+
+
+def test_hindi_today_morning_without_a_reference_stays_unresolved():
+    result = normalize_onset_statement("आज सुबह")
+    assert result.normalized_iso is None
+    assert result.period == "morning"
+    assert result.source == "unknown"
+
+
+def test_acknowledgement_is_never_stored_as_onset():
+    # The reported failure: the acknowledgement "अच्छा" answered the onset
+    # question and was stored as the onset date. A non-date answer must not
+    # be stored: the onset stays unknown and the bounded clarification
+    # re-asks; a valid relative expression still stores and resolves.
+    import datetime
+
+    engine = AEStateEngine.create_case("AE-onset-ack")
+    engine.update("product", "Lantus SoloStar")
+    engine.update("adverse_event", "rash")
+    engine.update("reporter_role", "self")
+    engine.update("patient_identifier", "Raju P K")
+    engine.update("patient_age", "25")
+    engine.update("consent_to_contact", True)
+    engine.update("preferred_contact_method", "phone")
+    from app.workflow.service.conversational import (
+        VOICE_CONFIRMATION_FIELDS,
+        ConversationalAEWorkflow,
+    )
+
+    workflow = ConversationalAEWorkflow(
+        engine, AnswerLLMProvider(), confirm_fields=VOICE_CONFIRMATION_FIELDS
+    )
+    workflow.process_turn("9886094321")
+    workflow.process_turn("yes")
+    asked = workflow.process_turn("no")  # severity -> onset pending
+    assert asked.next_question is not None
+    assert asked.next_question[0] == "onset_date"
+
+    acked = workflow.process_turn("अच्छा")
+    assert engine.case.onset_date is None  # never stored
+    assert acked.next_question is not None
+    assert acked.next_question[0] == "onset_date"  # re-asked (bounded loop)
+
+    from app.workflow.onset import is_recognizable_onset
+
+    assert is_recognizable_onset("अच्छा") is False
+    assert is_recognizable_onset("yesterday") is True
+    assert is_recognizable_onset(
+        "आज सुबह"
+    ) is True
+    assert is_recognizable_onset("27 May 2000") is True

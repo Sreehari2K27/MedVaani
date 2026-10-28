@@ -193,10 +193,11 @@ def test_identity_and_contact_read_backs_commit_before_consent():
     phone_turn = _turn(client, session_id)
     confirmed = _turn(client, session_id)
 
-    # The number is read back (last digits) before it is committed.
+    # The number is read back (digit count + last digits, never the number
+    # itself) before it is committed; this is the shipped engine wording.
     assert phone_turn["next_question"] == [
         "confirmation",
-        "I have the number ending in 0000. Is that correct?",
+        "I have a 10-digit number ending in 0000. Is that correct?",
     ]
     assert phone_turn["ae"]["collected_information"]["contact_phone"] is None
     assert phone_turn["current_state"] == "PATIENT_IDENTIFIED"
@@ -240,7 +241,7 @@ def test_filler_is_stripped_from_the_corrected_name():
         PATIENT_NAME,
         DOB,
         "no",  # Step 6B.2 read-back rejected
-        "no, only alpha beta",
+        "no, only Alpha Beta",
         "yes",
     ]
     client = _build_client(transcripts)
@@ -251,18 +252,18 @@ def test_filler_is_stripped_from_the_corrected_name():
     correction = _turn(client, session_id)
 
     corrected_readback = (
-        f"I have your details as alpha beta, {DOB_NORMALIZED}. "
+        f"I have your details as Alpha Beta, {DOB_NORMALIZED}. "
         "Is that correct?"
     )
     # "only" is filler: the read-back carries the clean value, not the filler.
     assert corrected_readback in correction["response_text"]
-    assert "only alpha beta" not in correction["response_text"]
+    assert "only Alpha Beta" not in correction["response_text"]
     assert correction["next_question"] == ["confirmation", corrected_readback]
     # The corrected value is still only a candidate until confirmed.
     assert correction["ae"]["collected_information"]["patient_identifier"] is None
 
     confirmed = _turn(client, session_id)
-    assert confirmed["ae"]["collected_information"]["patient_identifier"] == "alpha beta"
+    assert confirmed["ae"]["collected_information"]["patient_identifier"] == "Alpha Beta"
     assert confirmed["current_state"] == "PATIENT_IDENTIFIED"
 
 
@@ -337,8 +338,9 @@ def test_contact_confirmation_uses_the_same_attempt_bound():
         engine, AnswerLLMProvider(), confirm_fields=CONFIRMATION_FIELDS
     )
     readback = workflow.process_turn("9999990000")
-    # Approved Step 6B.4: the number is read back with its last digits.
-    assert "I have the number ending in 0000. Is that correct?" in (
+    # Approved Step 6B.4: the number is read back with its digit count and
+    # last digits (the shipped engine wording), never the number itself.
+    assert "I have a 10-digit number ending in 0000. Is that correct?" in (
         readback.response_text
     )
     assert engine.case.contact_phone is None  # candidate only, not committed

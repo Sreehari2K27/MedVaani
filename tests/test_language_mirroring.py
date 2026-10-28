@@ -7,9 +7,11 @@ translation catalog.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -93,6 +95,114 @@ def test_short_markerless_fragments_keep_the_current_language():
     assert detect_language("I have had a headache since yesterday.") == "en-IN"
 
 
+# ---- Devanagari digit-only utterances (shared hi/mr script) ------------------
+
+
+def test_devanagari_digit_only_utterances_return_no_language_evidence():
+    # Devanagari is shared by Hindi and Marathi: a dictated phone number in
+    # digit words (or digit glyphs) cannot tell the pair apart, so it is no
+    # language evidence at all and must keep the session language.
+    assert detect_language("दो दो चार चार") is None
+    assert detect_language("एक दोन तीन चार पाच सहा सात") is None
+    assert detect_language("नाइन टू फोर फोर वन नाइन") is None
+    assert detect_language("९२२४४") is None
+    # Any meaningful word restores the existing detection behaviour.
+    assert detect_language("दो दो चार दर्द") == "hi-IN"
+    assert detect_language("मुझे कल से सिर में दर्द है।") == "hi-IN"
+    assert detect_language("मला कालपासून डोके दुखत आहे") == "mr-IN"
+
+
+def test_marathi_session_survives_consecutive_digit_only_turns():
+    # A Marathi conversation stays Marathi across one or several
+    # Devanagari digit-only turns (a dictated phone number), and the
+    # confirmations/retry prompts keep speaking Marathi.
+    stt = _ScriptSTT(
+        [
+            "मला कालपासून डोके दुखत आहे",
+            "दो दो चार चार एक एक एक",
+            "दो दो चार चार एक एक एक",
+        ]
+    )
+    tts = _RecordingTTS()
+    client = _client(stt, tts)
+
+    first = _post(client, "marathi-digits", language="mr-IN")
+    assert first["conversation_language"] == "mr-IN"
+
+    for turn_index in range(2):
+        data = _post(client, "marathi-digits", language="mr-IN")
+        assert data["conversation_language"] == "mr-IN", f"turn {turn_index}"
+        assert data["language_translated"] is True
+        assert data["spoken_response_text"] != data["response_text"]
+        assert tts.calls[-1]["language"] == "mr-IN"
+    # Every STT call stayed on the session language.
+    assert stt.languages == ["mr-IN", "mr-IN", "mr-IN"]
+
+
+def test_markerless_devanagari_replies_are_weak_language_evidence():
+    # Short Devanagari confirmations/replies (होय, हुए) carry no Hindi or
+    # Marathi function-word marker: they cannot tell the shared-script pair
+    # apart and must never flip an established session.
+    assert detect_language("होय") is None
+    assert detect_language("हुए") is None
+    # Full sentences with distinguishing markers keep the existing detection.
+    assert detect_language("मुझे कल से सिर में दर्द है।") == "hi-IN"
+    assert detect_language("मला कालपासून डोके दुखत आहे") == "mr-IN"
+
+
+def test_marathi_session_survives_a_markerless_confirmation_turn():
+    # The reported sequence: after the user answers with the marker-less
+    # "होय", the next reporter-role question must still be Marathi - the
+    # session language is preserved and every later prompt stays translated.
+    stt = _ScriptSTT(
+        [
+            "मला कालपासून डोके दुखत आहे",
+            "Lantus",
+            "होय",
+            "हुए",
+        ]
+    )
+    tts = _RecordingTTS()
+    client = _client(stt, tts)
+
+    first = _post(client, "marathi-hoy", language="mr-IN")
+    assert first["conversation_language"] == "mr-IN"
+
+    for turn_index in range(3):
+        data = _post(client, "marathi-hoy", language="mr-IN")
+        assert data["conversation_language"] == "mr-IN", f"turn {turn_index}"
+        assert data["language_translated"] is True
+        assert data["spoken_response_text"] != data["response_text"]
+    assert stt.languages == ["mr-IN", "mr-IN", "mr-IN", "mr-IN"]
+
+
+def test_empty_transcript_retry_is_spoken_in_the_session_language():
+    # The reported failure: after "(No speech detected)" the assistant spoke
+    # English. The retry prompt must be rendered in the established session
+    # language, and an empty capture must not advance or change anything.
+    stt = _ScriptSTT(
+        [
+            "मला कालपासून डोके दुखत आहे",
+            "",  # the reported empty capture
+        ]
+    )
+    tts = _RecordingTTS()
+    client = _client(stt, tts)
+
+    first = _post(client, "marathi-empty", language="mr-IN")
+    assert first["conversation_language"] == "mr-IN"
+    state_after_first = first["current_state"]
+
+    empty = _post(client, "marathi-empty", language="mr-IN")
+    body = empty
+    assert body["reason"] == "empty_transcript"
+    assert body["conversation_language"] == "mr-IN"
+    assert body["language_translated"] is True
+    assert body["spoken_response_text"] != body["response_text"]
+    assert body["current_state"] == state_after_first  # nothing advanced
+    assert tts.calls[-1]["language"] == "mr-IN"
+
+
 def test_normalize_and_voice_mapping():
     assert normalize_language("hi") == "hi-IN"
     assert normalize_language("hi-IN") == "hi-IN"
@@ -138,12 +248,16 @@ def test_english_is_passthrough():
     assert result.text == "Take care."
 
 
-def test_language_without_catalog_falls_back():
-    result = translate("Take care.", "ta-IN")
+def test_unsupported_language_falls_back():
+    # Every supported language now has a catalog, so the English fallback
+    # applies to unsupported codes and to sentences missing from a catalog
+    # (covered by the parameterized fallback tests for the eight new
+    # languages above).
+    result = translate("Take care.", "xx-XX")
     assert result.translated is False
     assert result.language == DEFAULT_LANGUAGE
     assert translation_available("hi-IN") is True
-    assert translation_available("ta-IN") is False
+    assert translation_available("xx-XX") is False
 
 
 def test_urgent_safety_message_translates():
@@ -243,17 +357,19 @@ def test_english_conversation_stays_english():
     assert tts.calls[-1]["voice"] is None
 
 
-def test_unsupported_translation_language_falls_back_to_english_audio():
+def test_tamil_conversation_now_mirrors_in_tamil():
+    # Tamil previously had no catalog and fell back to English audio; with the
+    # catalog in place the same conversation must mirror in Tamil end-to-end.
     stt = _ScriptSTT(["எனக்கு தலைவலி உள்ளது", "இன்னும் உள்ளது"])
     tts = _RecordingTTS()
     client = _client(stt, tts)
 
     first = _post(client, "tamil-1")
     assert first["conversation_language"] == "ta-IN"
-    assert first["language_translated"] is False
-    assert first["spoken_response_text"] == first["response_text"]
-    assert tts.calls[-1]["language"] == "en-IN"
-    assert tts.calls[-1]["voice"] is None
+    assert first["language_translated"] is True
+    assert first["spoken_response_text"] != first["response_text"]
+    assert tts.calls[-1]["language"] == "ta-IN"
+    assert tts.calls[-1]["voice"] == "Asmita"
 
     _post(client, "tamil-1")
     # The transcript language still drives STT for the next turn.
@@ -409,3 +525,134 @@ def test_first_turn_hindi_hint_keeps_stt_and_tts_in_hindi():
     # Every STT call used the Hindi language code; en-IN never appears.
     assert stt.languages == ["hi-IN", "hi-IN"]
     assert tts.calls[-1]["language"] == "hi-IN"
+
+
+# ---- eight additional language catalogs --------------------------------------
+
+from app.language.catalog import SUPPORTED_LANGUAGES, VOICE_FOR_LANGUAGE  # noqa: E402
+from app.language.translation import (  # noqa: E402
+    _CATALOGS,
+    _HINDI_PATTERNS,
+    _HINDI_SENTENCES,
+)
+
+NEW_LANGUAGES = (
+    "bn-IN",
+    "gu-IN",
+    "kn-IN",
+    "ml-IN",
+    "mr-IN",
+    "pa-IN",
+    "ta-IN",
+    "te-IN",
+)
+
+# One reviewed sentence per language: a meaning-level regression anchor.
+_TAKE_CARE = {
+    "bn-IN": "নিজের যত্ন নিন।",
+    "gu-IN": "તમારું ધ્યાન રાખજો.",
+    "kn-IN": "ನಿಮ್ಮನ್ನು ನೀವು ನೋಡಿಕೊಳ್ಳಿ.",
+    "ml-IN": "നിങ്ങൾ ശ്രദ്ധിക്കുക.",
+    "mr-IN": "तुमची काळजी घ्या.",
+    "pa-IN": "ਆਪਣਾ ਧਿਆਨ ਰੱਖੋ।",
+    "ta-IN": "கவனமாக இருங்கள்.",
+    "te-IN": "మీ జాగ్రత్తగా ఉండండి.",
+}
+
+_URGENT_ENGLISH = "Please seek immediate medical attention now."
+_URGENT = {
+    "bn-IN": "অনুগ্রহ করে এখনই তাৎক্ষণিক চিকিৎসা সহায়তা নিন।",
+    "gu-IN": "કૃપા કરીને હમણાં જ તાત્કાલિક તબીબી સહાય મેળવો.",
+    "kn-IN": "ದಯವಿಟ್ಟು ಈಗಿನಿಂದ ತಕ್ಷಣ ವೈದ್ಯಕೀಯ ನೆರವು ಪಡಿ.",
+    "ml-IN": "ദയവായി ഉടനടി വൈദ്യസഹായം തേടുക.",
+    "mr-IN": "कृपया आत्ताच तातडीने वैद्यकीय मदत घ्या.",
+    "pa-IN": "ਕਿਰਪਾ ਕਰਕੇ ਹੁਣੇ ਤੁਰੰਤ ਮੈਡੀਕਲ ਮਦਦ ਲਵੋ।",
+    "ta-IN": "தயவுசெய்து இப்போதே உடனடியாக மருத்துவ உதவியை நாடுங்கள்.",
+    "te-IN": "దయచేసి ఇప్పుడే వెంటనే వైద్య సహాయం పొందండి.",
+}
+
+
+def _placeholders(template: str) -> list[str]:
+    return re.findall(r"\{\d+\}", template)
+
+
+@pytest.mark.parametrize("language", NEW_LANGUAGES)
+def test_new_language_catalog_covers_every_hindi_sentence_key(language):
+    sentences, _ = _CATALOGS[language]
+    missing = set(_HINDI_SENTENCES) - set(sentences)
+    assert not missing, f"{language} missing keys: {sorted(missing)[:5]}"
+
+
+@pytest.mark.parametrize("language", NEW_LANGUAGES)
+def test_new_language_patterns_mirror_hindi_placeholders(language):
+    _, patterns = _CATALOGS[language]
+    assert len(patterns) == len(_HINDI_PATTERNS)
+    for (hindi_pattern, hindi_template), (pattern, template) in zip(
+        _HINDI_PATTERNS, patterns
+    ):
+        assert pattern.pattern == hindi_pattern.pattern
+        assert _placeholders(template) == _placeholders(hindi_template)
+
+
+@pytest.mark.parametrize("language", NEW_LANGUAGES)
+def test_new_language_translates_fixed_sentences(language):
+    result = translate("Take care.", language)
+    assert result.translated is True
+    assert result.language == language
+    assert result.text == _TAKE_CARE[language]
+
+
+@pytest.mark.parametrize("language", NEW_LANGUAGES)
+def test_urgent_safety_instruction_translates_per_language(language):
+    result = translate(_URGENT_ENGLISH, language)
+    assert result.translated is True
+    assert result.language == language
+    assert result.text == _URGENT[language]
+    assert result.text != _URGENT_ENGLISH
+
+
+@pytest.mark.parametrize("language", NEW_LANGUAGES)
+def test_unknown_sentence_falls_back_to_english_for_new_languages(language):
+    text = "This sentence is not part of the fixed workflow catalogue."
+    result = translate(text, language)
+    assert result.translated is False
+    assert result.language == DEFAULT_LANGUAGE
+    assert result.text == text
+
+
+@pytest.mark.parametrize("language", NEW_LANGUAGES)
+def test_readback_pattern_interpolates_value_untranslated(language):
+    result = translate("I heard Rahul Sharma.", language)
+    assert result.translated is True
+    assert result.language == language
+    assert "Rahul Sharma" in result.text
+
+
+def test_voice_mapping_covers_all_ten_supported_languages():
+    for code in SUPPORTED_LANGUAGES:
+        assert voice_for(code) == VOICE_FOR_LANGUAGE[code]
+
+
+def test_hindi_translations_unchanged():
+    result = translate("Take care.", "hi-IN")
+    assert result.translated is True
+    assert result.text == "अपना ध्यान रखें।"
+    urgent = translate(_URGENT_ENGLISH, "hi-IN")
+    assert urgent.translated is True
+    assert urgent.text == "कृपया अभी तुरंत चिकित्सकीय सहायता लें।"
+    assert _CATALOGS["hi-IN"] == (_HINDI_SENTENCES, _HINDI_PATTERNS)
+
+
+def test_english_remains_passthrough():
+    result = translate(_URGENT_ENGLISH, "en-IN")
+    assert result.translated is False
+    assert result.text == _URGENT_ENGLISH
+
+
+def test_latin_marathi_replies_are_weak_language_evidence():
+    # The Latin-script transliterations of the Marathi confirmations carry
+    # no reliable hi/mr evidence: they keep the established session
+    # language (and never flip it to Hindi or English).
+    assert detect_language("hoy") is None
+    assert detect_language("barobar aahe") is None
+    assert detect_language("hoy te barobar aahe") is None

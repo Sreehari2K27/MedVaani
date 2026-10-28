@@ -13,6 +13,7 @@
 import {
   AE_STAGES,
   OPENING_MESSAGE,
+  initialLiveMessages,
   stageStatusText,
 } from "./aeDemoConversation.ts";
 
@@ -33,6 +34,23 @@ check(
   OPENING_MESSAGE ===
     "Thank you for taking the time to speak with us. I'm here to help record the event for review. I'm not a substitute for a healthcare professional, and I can't provide medical advice. Please tell me what happened, in your own words.",
   "opening matches the approved introduction and invitation exactly",
+);
+
+// ---- exactly one greeting message per fresh session ------------------------
+
+const seeded = initialLiveMessages();
+check(
+  seeded.length === 1 &&
+    seeded[0].role === "assistant" &&
+    seeded[0].text === OPENING_MESSAGE,
+  "a fresh session seeds exactly one assistant greeting message",
+);
+check(seeded[0].id === "ae-live-open", "the seeded greeting keeps its stable id");
+const otherMount = initialLiveMessages();
+otherMount.push({ id: "dup", role: "assistant", text: OPENING_MESSAGE });
+check(
+  initialLiveMessages().length === 1,
+  "each mount gets an independent list, so no rerender can stack a duplicate greeting",
 );
 
 // ---- sidebar stages follow the approved flow --------------------------------

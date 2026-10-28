@@ -72,3 +72,11 @@ export function stageStatusText(
 // per session, and never repeated after the person has described the event.
 export const OPENING_MESSAGE =
   "Thank you for taking the time to speak with us. I'm here to help record the event for review. I'm not a substitute for a healthcare professional, and I can't provide medical advice. Please tell me what happened, in your own words.";
+
+// The single greeting message seeded into a fresh session's chat. AeChat
+// passes this to its state initializer (runs once per mount), and the
+// voice-startup module never pushes another copy — the introduction is
+// displayed exactly once however the greeting request or playback behaves.
+export function initialLiveMessages(): AeChatMessage[] {
+  return [{ id: "ae-live-open", role: "assistant", text: OPENING_MESSAGE }];
+}

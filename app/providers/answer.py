@@ -54,6 +54,48 @@ _EMAIL_DICTATION_WORDS = frozenset(
         "rocketmail", "zoho", "aol", "msn",
     }
 )
+
+# Malayalam letter-name/dictation tokens the browser STT emits for a spoken
+# email dictation ("ആർ എ ജെ യു പി കെ അറ്റ് ദ റേറ്റ് ജിമെയിൽ ഡോട്ട് കോം"
+# -> "rajupk@gmail.com"). Each token maps to its intended Latin spelling;
+# the assembled address must still fully validate (_EMAIL + known TLD), so a
+# wrong letter can never be accepted. Only tokens evidenced by the transcript
+# are listed; other letter names stay unmapped rather than guessed.
+_MALAYALAM_EMAIL_TOKENS: Dict[str, str] = {
+    "ആർ": "r",
+    "എ": "a",
+    "എസ്": "s",
+    "ഇ": "e",
+    "എച്ച്": "h",
+    "ഐ": "i",
+    "ജെ": "j",
+    "ജി": "g",
+    "യു": "u",
+    "പി": "p",
+    "കെ": "k",
+    "മെയിൽ": "mail",
+    "ജിമെയിൽ": "gmail",
+    # The observed Devanagari-transcribed letter names and email
+    # terms (the browser STT wrote the spoken English letter names
+    # into Devanagari script): attested variants only.
+    "एस": "s",
+    "आर": "r",
+    "ई": "e",
+    "एच": "h",
+    "जीमेल": "gmail",
+    "कॉम": "com",
+    "കോം": "com",
+}
+
+# The Malayalam pronunciation of the "@" cue ("അറ്റ് ദ റേറ്റ്" = "at the
+# rate") and the spoken negation leads that may precede a dictated address
+# ("ഇല്ല ആർ …" means "no — it is  …", a correction, never a decline).
+_MALAYALAM_AT_RATE = re.compile(
+    r"അറ്റ്\s+ദ\s+റേറ്റ്"
+    r"|एट\s+द\s+रेट"
+    r"|अॅट\s+द\s+रेट"
+)
+_MALAYALAM_EMAIL_NEGATION = re.compile(r"^\s*(?:ഇല്ല|അല്ല|അതല്ല)[\s,]*")
 # Deterministic dictation forms of an email address: a short known lead-in is
 # dropped first, "at the rate" / a standalone "at" dictate "@", a standalone
 # "dot" dictates ".", and spacing directly around those components is removed.
@@ -84,7 +126,12 @@ _NEGATION = re.compile(
     r"\b(no|not|never|none|neither|without|denies|deny|refuse|refuses|"
     r"do not|don't|did not|didn't|was not|wasn't|is not|isn't|cannot|can't"
     r"|nahi|nahin)\b"
-    r"|नहीं|नही",
+    r"|नहीं|नही"
+    # Standalone negators of the other supported languages. Bare Indic
+    # tokens (vowel signs break \b, same rule as the Devanagari forms above);
+    # script-distinct, so they never overlap with _AFFIRM.
+    r"|ഇല്ല|അല്ല|അതല്ല|இல்லை|కాదు|లేదు|ಇಲ್ಲ|नाही|ના|નહીં|না|নয়|ਨਹੀਂ|ਨਾ"
+    r"|രണ്ടും\s+സെറ്റാക്കും",
     re.IGNORECASE,
 )
 _AFFIRM = re.compile(
@@ -98,7 +145,17 @@ _AFFIRM = re.compile(
     r"|theek\s+hai|thik\s+hai|sahmat|bilkul"
     r"|sahi\s+hai|sahi|jarur|zarur)\b"
     r"|जी हाँ|जी हां|हाँ|हां|ठीक\s+है|सहमत|बिल्कुल"
-    r"|सही\s+है|सही|जरूर|ज़रूर",
+    r"|सही\s+है|सही|जरूर|ज़रूर"
+    # Standalone affirmatives of the other supported languages (bare Indic
+    # tokens / \s+ compounds, same rule as the Devanagari forms above; the
+    # two token sets never overlap with _NEGATION). "യെസ്"/"യസ്" are the
+    # Malayalam-script transliterations of spoken "yes" that the browser
+    # STT emits. "hoy"/"ho"/"barobar"/"aahe" are the Latin-script
+    # transliterations of the Marathi affirmatives (word-boundary guarded,
+    # so English words containing them never match).
+    r"|അതെ|ശരി|ശരിയാണ്|യെസ്|യസ്|ஆம்|சரி|అవును|సరే|ಹೌದು|ಸರಿ|होय|बरोबर|હા|સાચું"
+    r"|\bhoy\b|\bho\b|\bbarobar\b|\baahe\b"
+    r"|হ্যাঁ|ঠিক\s+আছে|ਹਾਂ|ਠੀਕ\s+ਹੈ",
     re.IGNORECASE,
 )
 # Only explicit "serious" wording maps to the seriousness claim. Whether the
@@ -150,13 +207,30 @@ _EXPLICIT_CORRECTION = re.compile(
 # "solar star" product is never reclassified; the Devanagari sub-brand
 # ("सोलो स्टार") is recognised the same way.
 _PRODUCT_VARIANTS = re.compile(
-    r"\b(lantern|lantus|lantis|lantos|lanthus|lan\s+tus|solo\s*star|solostar"
+    r"\b(lantern|lantus|lantis|lantos|lanthus|lan\s+tus|landus|"
+    r"solo\s*star|solostar|zolo\s*star|zolostar"
     r"|lanta\s+sol(?:o|ar)\s+star|lantus\s+sol(?:o|ar)\s+star)\b"
     r"|सोलो\s*स्टार"
     # Narrow Devanagari transliterations of "Lantus" as STT emits them;
     # exact aliases only, no fuzzy matching (matras break \b, so bare
     # Devanagari like the सोलो स्टार token above).
-    r"|लेंटस|लैंटस|लैन्टस|लेन्टस",
+    r"|लेंटस|लैंटस|लैन्टस|लेन्टस"
+    # Observed Hindi STT variants of the brand stem ("लैंटर" never matched on
+    # its own; "लैंडर सोलो स्टार" reached Step 4 only via the sub-brand).
+    r"|लैंटर|लैंडर"
+    # Conservative exact native-script brand aliases for the other supported
+    # locales: bare Indic tokens (vowel signs break \b), \s* spacing inside
+    # the sub-brand compounds, no fuzzy matching — a garbled word (e.g. the
+    # Malayalam "കൊതുക") is never aliased.
+    r"|ল্যান্টাস|সোলো\s*স্টার"
+    r"|લાન્ટસ|લેન્ટસ|સોલો\s*સ્ટાર"
+    r"|ಲ್ಯಾಂಟಸ್|ಸೋಲೋ\s*ಸ್ಟಾರ್"
+    r"|ലാൻഡസ്|ലാൻറസ്|ലാൻടസ്|ലാന്ടസ്|ലാന്ദസ്|ലാറ്റസ്|സോ[ലള]ോ\s*സ്റ്റാർ"
+    r"|സോളോസ്റ്റാ|സോലോസ്റ്റാ"
+    r"|लँटस"
+    r"|ਲੈਂਟਸ|ਸੋਲੋ\s*ਸਟਾਰ"
+    r"|லான்டஸ்|லானடஸ்|சோலோ\s*ஸ்டார்"
+    r"|లాంటస్|సోలో\s*స్టార్",
     re.IGNORECASE,
 )
 _PRODUCT_CANONICAL = "Lantus SoloStar"
@@ -173,6 +247,16 @@ _OTHER_MEDICINE_VARIANTS = {
     ),
 }
 _OTHER_MEDICINE_CANONICAL = {"paracetamol": "Paracetamol"}
+
+# Replies containing letters of the supported Indic scripts (Devanagari,
+# Bengali, Gurmukhi, Gujarati, Tamil, Telugu, Kannada, Malayalam). Such a
+# reply that names no recognised medicine is unclear speech — never a
+# confirmed different medicine — and must be clarified instead of being
+# captured as a product value.
+_INDIC_SCRIPT_REPLY = re.compile(
+    r"[\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF"
+    r"\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F]"
+)
 
 # Cues that name a medicine as the suspected cause of the reaction
 # ("due to paracetamol", "पैरासिटामोल के कारण").
@@ -228,7 +312,11 @@ _UNKNOWN_ANSWER = re.compile(
     r"(?:know|remember|recall)\b|\bnot\s+sure\b|\bunsure\b|\bno\s+idea\b"
     # Hindi / Romanized-Hindi "don't know" and "don't remember".
     r"|pata\s+nahi|nahi\s+pata|yaad\s+nahi|nahi\s+yaad"
-    r"|पता\s+नहीं|नहीं\s+पता|याद\s+नहीं|नहीं\s+याद",
+    r"|पता\s+नहीं|नहीं\s+पता|याद\s+नहीं|नहीं\s+याद"
+    # "Don't know" in the other supported languages (bare Indic tokens /
+    # \s+ phrases, no \b for Indic scripts).
+    r"|അറിയില്ല|தெரியல|తెలియదు|ಗೊತ್ತಿಲ್ಲ"
+    r"|माहीत\s+नाही|ખબર\s+નથી|জানি\s+না|ਪਤਾ\s+ਨਹੀਂ",
     re.IGNORECASE,
 )
 # Expressed uncertainty ("maybe", "not sure", "hard to say") must never be
@@ -302,6 +390,17 @@ _ROLE_SELF = re.compile(
     # sentence is never over-read.
     r"|\b(?:mere\s+saath\s+(?:hi\s+)?hua|mujhe\s+(?:hi\s+)?hua|main\s+khud|mai\s+khud)\b"
     r"|\bmera\s+apna\s+(?:anubhav|experience)\b"
+    # The reported Devanagari self-answers: "यह मेरे साथ ही हुई घटना है"
+    # ("this happened to me myself" — the dative structure, mirroring the
+    # Malayalam structural pattern) and "ये मेरा अब खुद का अनुभव है" ("this
+    # is my own experience" — the possessive "मेरा/मेरी/मेरे" with one
+    # optional intervening word before "खुद का अनुभव"). Bare Indic tokens
+    # (no \b for Indic scripts).
+    r"|(?:\u092f\u0939|\u092f\u0947|\u092f\u0939\s+\u0918\u091f\u0928\u093e)?\s*"
+    r"\u092e\u0947\u0930\u0947\s+\u0938\u093e\u0925(?:\s+\u0939\u0940)?\s+"
+    r"\u0939\u0941(?:\u0908|\u0906)"
+    r"|(?:\u092e\u0947\u0930\u093e|\u092e\u0947\u0930\u0940|\u092e\u0947\u0930\u0947)"
+    r"\s+(?:\S+\s+)?\u0916\u0941\u0926\s+\u0915\u093e\s+\u0905\u0928\u0941\u092d\u0935"
     # "I'm the one experiencing/having it" (the verb list is narrow on
     # purpose: "I'm the one reporting for my wife" stays OTHER).
     r"|\b(?:i\s+am|i'?m|im)\s+the\s+one(?:\s+who)?(?:'s|\s+is|\s+was)?\s+"
@@ -320,7 +419,43 @@ _ROLE_SELF = re.compile(
     r"|(?:मेरा|अपना)\s+ही\s+अनुभव|यही\s+अनुभव"
     r"|\byahi\s+anubhav\b"
     r"|^\s*(?:ji\s+)?(?:haan\s*,?\s+)?(?:main|mai)\s+(?:hoon|hu)\b"
-    r"|^\s*(?:मैं|मै)\s+(?:हूँ|हूं)\s*[.!?]?\s*$",
+    r"|^\s*(?:मैं|मै)\s+(?:हूँ|हूं)\s*[.!?]?\s*$"
+    # First-person / own-experience cues for the other supported languages
+    # (bare Indic tokens, conservative exact phrases, the emphatic
+    # "me myself" and "my own experience" idioms, and the structural
+    # "happened to me" pattern).
+    r"|എനിക്ക്\s+തന്നെ"
+    # Chillu-spelling alternates: browser STT also emits എൻ്റെ (chillu ൻ,
+    # as in the audited combined name/DOB transcript), and the name-lead
+    # stripper already accepts both spellings - the role classifier must
+    # not know only one of them.
+    r"|(?:എന്റെ|എൻ്റെ)\s+സ്വന്തം\s+അനുഭവ"
+    r"|(?:എന്റെ|എൻ്റെ)\s+അനുഭവ"
+    r"|(?:എന്റെ|എൻ്റെ)\s+തന്നെ\s+അനുഭവ"
+    r"|എനിക്കാണ്\s+സംഭവിച്ചത്|എനിക്ക്\s+ആണ്\s+സംഭവിച്ചത്"
+    # "It happened to me": the dative/accusative pronoun directly followed
+    # (optionally with the emphatic തന്നെ/തന്നെയാണ് or ആണ് between) by the
+    # happened-stem സംഭവിച്ച- covers every verb ending without enumerating
+    # words. Adjacency keeps a later mention of another person unclassified
+    # (the pronoun is no longer next to the verb), and _ROLE_OTHER is still
+    # checked first for mixed answers.
+    r"|എനിക്ക്(?:\s+തന്നെ(?:യാണ്)?|\s+ആണ്)?\s+സംഭവിച്ച"
+    r"|എന്നെ(?:\s+തന്നെ(?:യാണ്)?|\s+ആണ്)?\s+സംഭവിച്ച"
+    r"|എനിക്കാണ്\s+സംഭവിച്ച"
+    # "The experience I had" (എനിക്കുണ്ടായ … അനുഭവം) and the emphatic
+    # first person "ഞാൻ തന്നെ"; the bare "ഞാനാണ്" is anchored to the whole
+    # reply (mirroring the anchored Hindi "मैं हूँ") so a mention inside a
+    # longer sentence is never over-read.
+    r"|എനിക്കുണ്ടായ"
+    r"|ഞാൻ\s+തന്നെ(?:യാണ്)?"
+    r"|^\s*ഞാനാണ്\s*[.!?]?\s*$"
+    r"|எனக்கு\s+தான்|என்னுடைய\s+சொந்த\s+அனுபவம்"
+    r"|నాకే|నా\s+సొంత\s+అనుభవం"
+    r"|ನನಗೆ\s+ಸಂಬಂಧಿಸಿದ|ನನ್ನ\s+ಸ್ವಂತ\s+ಅನುಭವ"
+    r"|আমার\s+নিজের\s+অভিজ্ঞতা|আমার\s+সাথেই"
+    r"|મને\s+જ|મારો\s+પોતાનો\s+અનુભવ"
+    r"|मलाच|माझा\s+स्वतःचा\s+अनुभव|मला\s+स्वत"
+    r"|ਮੈਨੂੰ\s+ਹੀ|ਮੇਰਾ\s+ਆਪਣਾ\s+ਤਜਰਬਾ",
     re.IGNORECASE,
 )
 _ROLE_OTHER = re.compile(
@@ -337,7 +472,43 @@ _ROLE_OTHER = re.compile(
     r"|मेरी\s+पत्नी|मेरे\s+पति|मेरा\s+बेटा|मेरी\s+बेटी|मेरा\s+लड़का|मेरी\s+लड़की"
     r"|मेरी\s+माँ|मेरे\s+पिता|मेरे\s+दोस्त|मेरे\s+रिश्तेदार|मेरे\s+भाई|मेरी\s+बहन"
     r"|\bdoosre\s+ke\s+liye\b|दूसरे\s+के\s+लिए"
-    r"|^\s*(?:koi\s+aur|कोई\s+और)\s*[.!?]?\s*$",
+    # "reporting on someone else's behalf": "किसी और की तरफ से बता रहा हूँ" /
+    # "kisi aur ki taraf se ..." (with or without the "ki"; फ may carry its
+    # nukta: तरफ़).
+    r"|किसी\s+और\s+(?:की\s+)?तरफ\u093c?\s+से|\bkisi\s+aur\s+(?:ki\s+)?taraf\s+se\b"
+    # Bare "someone else" reply, anchored to the whole reply: "koi aur" /
+    # "koi aur ka" / "कोई और" / "किसी और का".
+    r"|^\s*(?:koi\s+aur|kisi\s+aur|कोई\s+और|किसी\s+और)"
+    r"\s*(?:ka|ki|ke|का|की|के)?\s*[.!?]?\s*$"
+    # Someone-else cues for the other supported languages: "on behalf of
+    # another person" and possessive + relative forms (checked before
+    # _ROLE_SELF, so "no, it happened to my wife" stays someone else).
+    # Chillu എൻ്റെ alternate (the same STT spelling variation _ROLE_SELF
+    # accepts): a chillu possessive before a relative stays someone_else.
+    r"|മറ്റൊരാൾക്ക്\s+വേണ്ടി|(?:എന്റെ|എൻ്റെ)\s+(?:ഭാര്യ|ഭർത്താവ്|മകൻ|മകൾ|അമ്മ|അച്ഛൻ)"
+    # Dative-spelling variants: the l-sound before ക്ക് is written with the
+    # chillu ൾ (either encoding, U+0D7E / U+0D3D) or as the explicit ള്
+    # spelling — the reported phrase is "മറ്റൊരാള്ക്ക് വേണ്ടി റിപ്പോര്ട്ട്
+    # ചെയ്യണം" (reporting on behalf of another person).
+    r"|മറ്റൊരാ(?:[\u0D7E\u0D3D]|\u0D33\u0D4D)ക്ക്\s+വേണ്ടി"
+    # "someone else's?" — the possessive-pronoun follow-up at the identity
+    # question, with or without the doubt particle ോ.
+    r"|മറ്റാരുടേതോ?"
+    # "reporting about/about another person's report" — the observed
+    # dative ("മറ്റൊരാ[ള്ക്ക|ൾക്ക]ാണ്") and possessive ("മറ്റാരുടെ")
+    # cues before the report noun. The റ-cluster accepts both the ര്
+    # spelling and either chillu encoding of ർ (sign U+0D3C / letter
+    # U+0D7C), and the final ് may contract away before ആണ്.
+    r"|മറ്റൊരാ(?:ൾക്കാണ്|ള്ക്കാണ്|ൾക്ക്\s*ആണ്|ള്ക്ക്\s*ആണ്)"
+    r"\s*റിപ്പോ(?:ര്|[\u0D3C\u0D7C])ട്ട്?"
+    r"|മറ്റാരുടെ\s*റിപ്പോ(?:ര്|[\u0D3C\u0D7C])ട്ട്?"
+    r"|অন্য\s+কারো\s+জন্য|আমার\s+(?:স্ত্রী|স্বামী|ছেলে|মেয়ে|মা|বাবা)"
+    r"|બીજા\s+કોઈ\s+માટે|મારી\s+(?:પત્ની|પતિ|દીકરો|દીકરી)"
+    r"|ಬೇರೊಬ್ಬರಿಗಾಗಿ|ನನ್ನ\s+(?:ಹೆಂಡತಿ|ಗಂಡ|ಮಗ|ಮಗಳು)"
+    r"|दुसऱ्यासाठी|माझ्या\s+(?:पत्नी|पती|मुलाचा|लेकीची)"
+    r"|ਕਿਸੇ\s+ਹੋਰ\s+ਲਈ|ਮੇਰੀ\s+(?:ਪਤਨੀ|ਪਤੀ|ਬੇਟਾ|ਬੇਟੀ)"
+    r"|வேறு\s+ஒருவருக்காக|என்னுடைய\s+(?:மனைவி|கணவர்|மகன்|மகள்)"
+    r"|వేరొకరి\s+కోసం|నా\s+(?:భార్య|భర్త|కొడుకు|కూతురు)",
     re.IGNORECASE,
 )
 # Symptom still present / unchanged. Maps to ``not_recovered``: a patient
@@ -450,6 +621,33 @@ _MAX_AGE = 150
 _SPOKEN_DIGIT_WORDS = {word: str(value) for word, value in _ONES.items() if value <= 9}
 _MIN_PHONE_DIGITS = 7
 
+# The longest supported local contact number: 10 digits, or 11 when the
+# number carries a leading zero (the STD-prefixed form). A longer run is a
+# dictation/transcription artifact (a doubled digit, an extra word) and is
+# never silently accepted as a contact number.
+_MAX_PHONE_DIGITS = 10
+
+
+def _is_plausible_phone(run: str | None) -> bool:
+    """Whether an extracted digit run has a plausible contact-number length.
+
+    The established minimum is ``_MIN_PHONE_DIGITS``; the maximum is
+    ``_MAX_PHONE_DIGITS``, relaxed for the attested prefixed forms: an
+    11-digit run with a leading zero (the STD-prefixed national form) and
+    a 12-digit run with the ``91`` country prefix (the documented
+    ``+91 …`` input). Leading zeros/prefixes are preserved; the run is
+    never trimmed or padded to force a length."""
+    if not isinstance(run, str):
+        return False
+    digits = re.sub(r"\D", "", run)
+    if 7 <= len(digits) <= _MAX_PHONE_DIGITS:
+        return True
+    if len(digits) == _MAX_PHONE_DIGITS + 1:
+        return digits.startswith("0")
+    if len(digits) == _MAX_PHONE_DIGITS + 2:
+        return digits.startswith("91")
+    return False
+
 # Hindi zero words; Hindi one-nine reuse _DEVANAGARI_NUMBERS (single-digit
 # entries only, looked up lazily inside the function below).
 _HINDI_ZERO_DIGIT_WORDS = {"शून्य": "0", "जीरो": "0", "ज़ीरो": "0"}
@@ -469,19 +667,49 @@ _TRANSLITERATED_DIGIT_WORDS = {
     "सेवन": "7",
     "एट": "8",
     "ऐट": "8",
+    # The observed ASR spellings of "nine" and "zero" (the ि/ी matra and
+    # the झ variant), mirroring the known variants already mapped above.
     "नाइन": "9",
+    "नाईन": "9",
     "जीरो": "0",
     "ज़ीरो": "0",
+    "झीरो": "0",
 }
 
-# Keep Latin and Devanagari letters; everything else (digits, punctuation)
-# separates tokens. The Devanagari danda "।"/"॥" lives inside the Devanagari
-# block but is punctuation, so it is replaced before splitting.
-_SPOKEN_PHONE_TOKENS = re.compile(r"[^a-zऀ-ॿ]+")
+# Keep Latin letters, ASCII digits, and the letters of every supported Indic
+# script (Devanagari, Bengali, Gurmukhi, Gujarati, Tamil, Telugu, Kannada,
+# Malayalam — full blocks, mirroring the existing Devanagari handling, which
+# keeps each script's own digit glyphs inside tokens); everything else
+# (punctuation) separates tokens. ASCII digits are kept so a transcript that
+# mixes spoken digit words with literal digits ("nine 2 2 four four …")
+# preserves every digit in order.
+_SPOKEN_PHONE_TOKENS = re.compile(
+    r"[^a-z0-9"
+    r"\u0900-\u097F"  # Devanagari (Hindi, Marathi)
+    r"\u0980-\u09FF"  # Bengali
+    r"\u0A00-\u0A7F"  # Gurmukhi
+    r"\u0A80-\u0AFF"  # Gujarati
+    r"\u0B80-\u0BFF"  # Tamil
+    r"\u0C00-\u0C7F"  # Telugu
+    r"\u0C80-\u0CFF"  # Kannada
+    r"\u0D00-\u0D7F"  # Malayalam
+    r"]+"
+)
 
 
 def _spoken_digit_lookup(token: str) -> str | None:
-    """The single digit a spoken token dictates, or ``None``."""
+    """The single digit a spoken token dictates, or ``None``.
+
+    A token made entirely of digit glyphs (ASCII ``0-9`` or any supported
+    script's digits, e.g. Devanagari ``०-९``) contributes its digits in
+    order, so a transcript mixing spoken digit words with literal digits
+    ("nine 2 2 four four") preserves every digit including repeats and
+    leading zeros."""
+    if token and token.isdigit():
+        try:
+            return "".join(str(int(ch)) for ch in token)
+        except ValueError:
+            return None
     if token in _SPOKEN_DIGIT_WORDS:
         return _SPOKEN_DIGIT_WORDS[token]
     if token in _HINDI_ZERO_DIGIT_WORDS:
@@ -491,7 +719,12 @@ def _spoken_digit_lookup(token: str) -> str | None:
     value = _DEVANAGARI_NUMBERS.get(token)
     if value is not None and value <= 9:
         return str(value)
-    return _TRANSLITERATED_DIGIT_WORDS.get(token)
+    digit = _TRANSLITERATED_DIGIT_WORDS.get(token)
+    if digit is not None:
+        return digit
+    # The other supported locales' digit words (zero..nine, from the
+    # reviewed locale tables).
+    return _ALL_LOCALE_DIGIT_WORDS.get(token)
 
 
 def _extract_spoken_phone(text: str) -> str | None:
@@ -519,7 +752,10 @@ def _extract_spoken_phone(text: str) -> str | None:
     ):
         digit = _spoken_digit_lookup(token)
         if digit is not None:
-            run.append(digit)
+            # A digit-word token contributes one digit; a digit-glyph token
+            # ("९२२४४…") contributes each of its digits in order, so the
+            # minimum-length check below counts actual digits.
+            run.extend(digit)
         else:
             flush()
     flush()
@@ -541,6 +777,10 @@ def _spelled_email(text: str) -> str | None:
     work = (text or "").strip().lower()
     if not work:
         return None
+    # A leading Malayalam negation before a dictated address ("ഇല്ല ആർ …
+    # ഡോട്ട് കോം") is a correction lead, never a decline: strip it the same
+    # way the Latin "no, …" lead below is removed.
+    work = _MALAYALAM_EMAIL_NEGATION.sub("", work)
     # Correction leads ("no, the email should be ...", "it should be ...").
     work = re.sub(r"^\s*(?:no|nope)[,\s!]+", "", work)
     work = re.sub(
@@ -551,8 +791,9 @@ def _spelled_email(text: str) -> str | None:
     )
     # The phrase cue becomes the "@" token before tokenising.
     work = re.sub(r"\bat\s+the\s+rate\b", "@", work)
+    work = _MALAYALAM_AT_RATE.sub("@", work)
     has_at = bool(re.search(r"\bat\b|@", work))
-    has_dot = bool(re.search(r"\bdot\b|\.", work))
+    has_dot = bool(re.search(r"\bdot\b|\.", work) or "ഡോട്ട്" in work or "डॉट" in work)
     if not (has_at and has_dot):
         return None
 
@@ -570,7 +811,7 @@ def _spelled_email(text: str) -> str | None:
             out.append("@")
             seen_at = True
             continue
-        if token == "dot":
+        if token in ("dot", "ഡോട്ട്", "डॉट"):
             out.append(".")
             continue
         if token == "underscore":
@@ -579,9 +820,22 @@ def _spelled_email(text: str) -> str | None:
         if token in ("hyphen", "dash"):
             out.append("-")
             continue
+        # Malayalam dictation tokens translate to their Latin spelling before
+        # the letter/word logic: letter names become single letters ("പി" ->
+        # "p"), provider/domain words become words ("ജിമെയിൽ" -> "gmail").
+        token = _MALAYALAM_EMAIL_TOKENS.get(token, token)
         digit = _spoken_digit_lookup(token)
         if digit is not None:
             out.append(digit)
+            continue
+        if seen_at and "." in token and re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9.+-]*[a-z0-9])?", token
+        ):
+            # A compact domain token directly after the "@" cue
+            # ("@ GMAIL.COM", "at gmail.com"): appended verbatim. The full
+            # address is still validated below (single "@", _EMAIL, and a
+            # recognised final label), so nothing is ever guessed.
+            out.append(token)
             continue
         if not seen_at:
             # The local part must be either fully spelled ("s, r, e, e") or
@@ -851,6 +1105,35 @@ _DOB_NAME_LEAD = re.compile(
     r"(?i)(?:^|[\s,;&]+)(?:and\s+)?(?:my\s+)?(?:date\s+of\s+birth|dob)\s*(?:is|:)?\s*$"
 )
 
+# The Hindi equivalent for combined answers: "अल्फा बीटा और जन्मदिन पच्चीस
+# में दो हजार पाँच" — everything from the DOB lead to the end (the lead,
+# an optional possessive such as "मेरा", and the date attempt, parseable or
+# not) is never part of the name. The date itself is handled by the DOB
+# parsers when it is well formed.
+_HINDI_DOB_NAME_TAIL = re.compile(
+    r"\s+(?:और\s+)?(?:मेरा\s+|मेरी\s+)?(?:जन्मदिन|जन्म\s+तिथि)(?:\s+.*)?$"
+    # Malayalam combined answers ("… ജന്മദിനം ഇരുപത് മെയ് …", with the
+    # connector "പിന്നെ", the ജന്മതിഥി label spelling and the observed ASR
+    # variant ജന്മതിയി of it): everything from the DOB lead to the end is
+    # never part of the name.
+    r"|\s+ജന്മദിനം(?:\s+.*)?$"
+    r"|\s+(?:പിന്നെ\s+)?(?:ജന്മതിഥി|ജന്മതിയി)(?:\s+.*)?$"
+    # The remaining supported locales' DOB labels (established project
+    # phrases, mirrored from the workflow's _DOB_CHOICE): everything from
+    # the label to the end is never part of the name.
+    r"|\s+(?:জন্ম\s+তারিখ|জন্মদিন)(?:\s+.*)?$"
+    r"|\s+(?:જન્મ\s+તારીખ|જન્મદિન)(?:\s+.*)?$"
+    r"|\s+(?:ಜನ್ಮ\s+ದಿನಾಂಕ|ಹುಟ್ಟಿದ\s+ದಿನ)(?:\s+.*)?$"
+    # Marathi combined answers ("… राजू के आणि माझा जन्मतारीख वीस जुलै
+    # …"): the conjunction "आणि" and the possessive leads "माझा/माझं/माझी"
+    # before the DOB label are never part of the name (mirroring the Hindi
+    # branch's "और मेरा" prefix above).
+    r"|\s+(?:आणि\s+)?(?:माझा\s+|माझं\s+|माझी\s+)?(?:जन्मतारीख|जन्मदिन)(?:\s+.*)?$"
+    r"|\s+(?:ਜਨਮ\s+ਤਾਰੀਖ|ਜਨਮਦਿਨ)(?:\s+.*)?$"
+    r"|\s+(?:பிறந்த\s+தேதி|பிறந்தநாள்)(?:\s+.*)?$"
+    r"|\s+(?:పుట్టిన\s+తేదీ|జన్మ\s+దినం)(?:\s+.*)?$"
+)
+
 _DOB_MONTH_DATE = re.compile(
     # "12 March 1980", "21-Mar-2008" (day and month name may be joined by a
     # space or a hyphen, the form a typed DD-MMM-YYYY answer produces).
@@ -993,6 +1276,660 @@ def _dob_year_ok(year: int) -> bool:
     return 1900 <= year <= date.today().year
 
 
+# Hindi month names (Devanagari) with the common STT spellings, for spoken
+# dates of birth like "पच्चीस मई दो हजार चार" (25-May-2004). "मे" and "में"
+# are frequent speech-recognition variants of मई; they are accepted only in
+# the complete date shape (see _extract_hindi_dob) because both double as
+# everyday words/particles.
+_HINDI_MONTHS: Dict[str, int] = {
+    "जनवरी": 1,
+    "फ़रवरी": 2,
+    "फरवरी": 2,
+    "मार्च": 3,
+    "अप्रैल": 4,
+    "मई": 5,
+    "मे": 5,
+    "में": 5,
+    "जून": 6,
+    "जुलाई": 7,
+    "अगस्त": 8,
+    "सितम्बर": 9,
+    "सितंबर": 9,
+    "अक्टूबर": 10,
+    "नवम्बर": 11,
+    "नवंबर": 11,
+    "दिसम्बर": 12,
+    "दिसंबर": 12,
+}
+
+# The date-marker-prone variants: accepted only when every component of the
+# date is present, so an incomplete/ambiguous "… में दो हजार" is never read
+# as a month.
+_HINDI_MONTH_VARIANTS = frozenset({"मे", "में"})
+
+
+def _extract_hindi_dob(text: str) -> tuple[Optional[date], Optional[str]]:
+    """A Devanagari spoken date of birth and its verbatim form, or none.
+
+    Matches "<day word> <Hindi month> दो हजार [<year unit>]", e.g.
+    "पच्चीस मई दो हजार चार" -> 25-May-2004 (also with the STT variants
+    "मे"/"में" for मई, and with nukta spellings such as "हज़ार"). The day
+    and the year may each be a plain 4-digit-or-fewer digit token, because
+    STT commonly transcribes spoken numbers as digits ("पच्चीस मई 2004").
+    Day, month and the year (the "दो हजार" lead or a digit year) must all be
+    present; the variant months additionally require the unit word so an
+    ambiguous date marker is never guessed as a month. Nothing else is
+    inferred, so a month-less "पच्चीस दो हजार चार" yields no date.
+    """
+    raw_tokens = [
+        token.strip(".,!?()\"'\u0964")
+        for token in (text or "").replace("\u0964", " ").split()
+    ]
+    # Lookup tokens ignore the nukta (हज़ार/फ़रवरी); the raw tokens are kept
+    # for the verbatim form so later name-splitting replaces the original text.
+    tokens = [token.replace("\u093c", "") for token in raw_tokens]
+    for index, token in enumerate(tokens):
+        month = _HINDI_MONTHS.get(token)
+        if month is None or index == 0 or index + 1 >= len(tokens):
+            continue
+        day = _DEVANAGARI_NUMBERS.get(tokens[index - 1])
+        if day is None and tokens[index - 1].isdigit():
+            day = int(tokens[index - 1])
+        if day is None or not 1 <= day <= 31:
+            continue
+        # A digit year ("2004") is an exact spoken year; the "दो हजार" word
+        # lead keeps the existing unit/filler rules. A variant month (मे/में)
+        # stays conservative: a bare "दो हजार"/digit year after it is never
+        # enough to read the marker as the month.
+        year_token = tokens[index + 1]
+        digit_year = year_token.isdigit() and len(year_token) == 4
+        if digit_year and token not in _HINDI_MONTH_VARIANTS:
+            if not _dob_year_ok(int(year_token)):
+                continue
+            try:
+                parsed = date(int(year_token), month, day)
+            except ValueError:
+                continue
+            return parsed, " ".join(raw_tokens[index - 1 : index + 2])
+        if index + 2 >= len(tokens):
+            continue
+        if tokens[index + 1] != "\u0926\u094b" or tokens[index + 2] != "\u0939\u091c\u093e\u0930":
+            continue
+        if index + 3 < len(tokens):
+            unit = _DEVANAGARI_NUMBERS.get(tokens[index + 3])
+            unit_end = index + 3
+            if unit is None and tokens[index + 3] in _HINDI_DATE_FILLERS:
+                # "… दो हजार है": the particle is speech filler, never part
+                # of the date; an optional year unit may follow it
+                # ("… दो हजार चार है"). A variant month (मे/में) still
+                # requires that unit word — filler alone never disambiguates.
+                if index + 4 < len(tokens):
+                    unit = _DEVANAGARI_NUMBERS.get(tokens[index + 4])
+                    unit_end = index + 4
+                elif token not in _HINDI_MONTH_VARIANTS:
+                    # "दो हजार" alone: the year is exactly 2000.
+                    unit = 0
+                    unit_end = index + 2
+            if unit is None or unit > 99:
+                # Unrecognisable text follows the year lead: ambiguous, so
+                # the date is never guessed at.
+                continue
+            year = 2000 + unit
+            end = unit_end
+        elif token in _HINDI_MONTH_VARIANTS:
+            # "… में दो हजार" without the unit word: the marker may not be a
+            # month at all, so an ambiguous date is never confirmed.
+            continue
+        else:
+            year = 2000
+            end = index + 2
+        if not _dob_year_ok(year):
+            continue
+        try:
+            parsed = date(year, month, day)
+        except ValueError:
+            continue
+        return parsed, " ".join(raw_tokens[index - 1 : end + 1])
+    return None, None
+
+
+# ---- spoken DOB tables for the other supported languages ---------------------
+# Conservative, data-only tables mirroring the Hindi parser's shape: a
+# complete "<day> <month> <year>" phrase is required, nothing is inferred,
+# and only unambiguous year-unit forms (2001-2009) are supported. Tables
+# should be native-speaker-reviewed before production trust.
+
+_SPOKEN_DATE_TABLES: Dict[str, Dict[str, Any]] = {
+    "ml-IN": {
+        "days": {
+            "ഒന്ന്": 1, "രണ്ട്": 2, "മൂന്ന്": 3, "നാല്": 4, "അഞ്ച്": 5,
+            "ആറ്": 6, "ഏഴ്": 7, "എട്ട്": 8, "ഒമ്പത്": 9,
+            # The chillu spelling of nine ("ഒൻപത്") that the browser STT
+            # emitted for phone digits; "ഒമ്പത്" and "ഒൻപത്" are both
+            # standard Malayalam spellings.
+            "ഒൻപത്": 9, "പത്ത്": 10,
+            "പതിനൊന്ന്": 11, "പന്ത്രണ്ട്": 12, "പതിമൂന്ന്": 13,
+            "പതിനാല്": 14, "പതിനഞ്ച്": 15, "പതിനാറ്": 16,
+            "പതിനേഴ്": 17, "പതിനെട്ട്": 18, "പത്തൊൻപത്": 19,
+            "പത്തൊമ്പത്": 19, "ഇരുപത്": 20, "ഇരുപത്തൊന്ന്": 21,
+            "ഇരുപത്തിയൊന്ന്": 21, "ഇരുപത്തിരണ്ട്": 22,
+            "ഇരുപത്തിമൂന്ന്": 23, "ഇരുപത്തിനാല്": 24,
+            "ഇരുപത്തിയഞ്ച്": 25, "ഇരുപത്തിയാറ്": 26,
+            "ഇരുപത്തിയേഴ്": 27, "ഇരുപത്തിയെട്ട്": 28,
+            "ഇരുപത്തൊൻപത്": 29, "ഇരുപത്തൊമ്പത്": 29, "മുപ്പത്": 30,
+            "മുപ്പത്തൊന്ന്": 31, "മുപ്പത്തിയൊന്ന്": 31,
+            # Spaced compound day forms (ASR often emits the compound with a
+            # space, mirroring the Telugu table's "ఇరవై ఒకటി" pattern);
+            # without these, "ഇരുപത്തി രണ്ട്" silently matched the unit word
+            # alone as day 2.
+            "ഇരുപത്തി ഒന്ന്": 21, "ഇരുപത്തി രണ്ട്": 22,
+            "ഇരുപത്തി മൂന്ന്": 23, "ഇരുപത്തി നാല്": 24,
+            "ഇരുപത്തി അഞ്ച്": 25, "ഇരുപത്തി ആറ്": 26,
+            "ഇരുപത്തി ഏഴ്": 27, "ഇരുപത്തി എട്ട്": 28,
+            "ഇരുപത്തി ഒമ്പത്": 29, "മുപ്പത്തി ഒന്ന്": 31,
+        },
+        "months": {
+            "ജനുവരി": 1, "ഫെബ്രുവരി": 2, "മാർച്ച്": 3, "മാർച്ച": 3,
+            "ഏപ്രിൽ": 4, "മെയ്": 5, "മേയ്": 5, "മേ": 5, "ജൂൺ": 6,
+            "ജൂലൈ": 7, "ഓഗസ്റ്റ്": 8, "ഓഗസ്റ്റ": 8, "സെപ്റ്റംബർ": 9,
+            "ഒക്ടോബർ": 10, "നവംബർ": 11, "ഡിസംബർ": 12,
+        },
+        "year_leads": {"രണ്ടായിരം": 2000, "രണ്ടായിരത്തി": 2000},
+        "year_units": {
+            "ഒന്ന്": 1, "രണ്ട്": 2, "മൂന്ന്": 3, "നാല്": 4, "അഞ്ച്": 5,
+            "ആറ്": 6, "ഏഴ്": 7, "എട്ട്": 8, "ഒമ്പത്": 9,
+        },
+    },
+    "bn-IN": {
+        "days": {
+            "এক": 1, "দুই": 2, "তিন": 3, "চার": 4, "পাঁচ": 5, "ছয়": 6,
+            "সাত": 7, "আট": 8, "নয়": 9, "দশ": 10, "এগারো": 11, "বারো": 12,
+            "তেরো": 13, "চৌদ্দ": 14, "পনেরো": 15, "ষোলো": 16,
+            "সতেরো": 17, "আঠারো": 18, "উনিশ": 19, "বিশ": 20, "একুশ": 21,
+            "বাইশ": 22, "তেইশ": 23, "চব্বিশ": 24, "পঁচিশ": 25,
+            "ছাব্বিশ": 26, "সাতাশ": 27, "আটাশ": 28, "উনত্রিশ": 29,
+            "ত্রিশ": 30, "একত্রিশ": 31,
+        },
+        "months": {
+            "জানুয়ারি": 1, "জানুয়ারী": 1, "জানুযারি": 1, "জানুযারী": 1,
+            "ফেব্রুয়ারি": 2, "ফেব্রুয়ারী": 2, "ফেব্রুযারি": 2, "ফেব্রুযারী": 2,
+            "মার্চ": 3, "এপ্রিল": 4, "মে": 5, "জুন": 6, "জুলাই": 7, "আগস্ট": 8,
+            "সেপ্টেম্বর": 9, "অক্টোবর": 10, "নভেম্বর": 11, "ডিসেম্বর": 12,
+        },
+        "year_leads": {"দুই হাজার": 2000},
+        "year_units": {
+            "এক": 1, "দুই": 2, "তিন": 3, "চার": 4, "পাঁচ": 5, "ছয়": 6,
+            "সাত": 7, "আট": 8, "নয়": 9,
+        },
+    },
+    "gu-IN": {
+        "days": {
+            "એક": 1, "બે": 2, "ત્રણ": 3, "ચાર": 4, "પાંચ": 5, "છ": 6,
+            "સાત": 7, "આઠ": 8, "નવ": 9, "દસ": 10, "અગિયાર": 11,
+            "બાર": 12, "તેર": 13, "ચૌદ": 14, "પંદર": 15, "સોળ": 16,
+            "સત્તાર": 17, "અઢાર": 18, "ઓગણીસ": 19, "વીસ": 20,
+            "એકવીસ": 21, "બાવીસ": 22, "તેવીસ": 23, "ચોવીસ": 24,
+            "પચીસ": 25, "છવીસ": 26, "સત્તાવીસ": 27, "અઠ્ઠાવીસ": 28,
+            "ઓગણત્રીસ": 29, "ત્રીસ": 30, "એકત્રીસ": 31,
+        },
+        "months": {
+            "જાન્યુઆરી": 1, "ફેબ્રુઆરી": 2, "માર્ચ": 3, "એપ્રિલ": 4,
+            "મે": 5, "જૂન": 6, "જુલાઈ": 7, "ઓગસ્ટ": 8,
+            "સપ્ટેમ્બર": 9, "ઓક્ટોબર": 10, "નવેમ્બર": 11, "ડિસેમ્બર": 12,
+        },
+        "year_leads": {"બે હજાર": 2000},
+        "year_units": {
+            "એક": 1, "બે": 2, "ત્રણ": 3, "ચાર": 4, "પાંચ": 5, "છ": 6,
+            "સાત": 7, "આઠ": 8, "નવ": 9,
+        },
+    },
+    "kn-IN": {
+        "days": {
+            "ಒಂದು": 1, "ಎರಡು": 2, "ಮೂರು": 3, "ನಾಲು": 4, "ಐದು": 5,
+            "ಆರು": 6, "ಏಳು": 7, "ಎಂಟು": 8, "ಒಂಬತ್ತು": 9, "ಹತ್ತು": 10,
+            "ಹನ್ನೊಂದು": 11, "ಹನ್ನೆರಡು": 12, "ಹದಿಮೂರು": 13,
+            "ಹದಿನಾಲ್ಕು": 14, "ಹದಿನೈದು": 15, "ಹದಿನಾರು": 16,
+            "ಹದಿನೇಳು": 17, "ಹದಿನೆಂಟು": 18, "ಹತ್ತೊಂಬತ್ತು": 19,
+            "ಇಪ್ಪತ್ತು": 20, "ಇಪ್ಪತ್ತೊಂದು": 21, "ಇಪ್ಪತ್ತೆರಡು": 22,
+            "ಇಪ್ಪತ್ತಮೂರು": 23, "ಇಪ್ಪತ್ತನಾಲ್ಕು": 24, "ಇಪ್ಪತ್ತೈದು": 25,
+            "ಇಪ್ಪತ್ತಾರು": 26, "ಇಪ್ಪತ್ತೇಳು": 27, "ಇಪ್ಪತ್ತೆಂಟು": 28,
+            "ಇಪ್ಪತ್ತೊಂಬತ್ತು": 29, "ಮೂವತ್ತು": 30, "ಮೂವತ್ತೊಂದು": 31,
+        },
+        "months": {
+            "ಜನವರಿ": 1, "ಫೆಬ್ರವರಿ": 2, "ಫೆಬ್ರುವರಿ": 2, "ಮಾರ್ಚ್": 3,
+            "ಮಾರ್ಚಿ": 3, "ಏಪ್ರಿಲ್": 4, "ಮೇ": 5, "ಜೂನ್": 6, "ಜುಲೈ": 7,
+            "ಆಗಸ್ಟ್": 8, "ಸೆಪ್ಟೆಂಬರ್": 9, "ಅಕ್ಟೋಬರ್": 10, "ನವೆಂಬರ್": 11,
+            "ಡಿಸೆಂಬರ್": 12,
+        },
+        "year_leads": {"ಎರಡು ಸಾವಿರ": 2000, "ಎರಡು ಸಾವಿರದ": 2000},
+        "year_units": {
+            "ಒಂದು": 1, "ಎರಡು": 2, "ಮೂರು": 3, "ನಾಲು": 4, "ಐದು": 5,
+            "ಆರು": 6, "ಏಳು": 7, "ಎಂಟು": 8, "ಒಂಬತ್ತು": 9,
+        },
+    },
+    "mr-IN": {
+        "days": {
+            "एक": 1, "दोन": 2, "तीन": 3, "चार": 4, "पाच": 5, "सहा": 6,
+            "सात": 7, "आठ": 8, "नऊ": 9, "दहा": 10, "अकरा": 11, "बारा": 12,
+            "तेरा": 13, "चौदा": 14, "पंधरा": 15, "सोळा": 16, "सतरा": 17,
+            "अठरा": 18, "एकोणीस": 19, "वीस": 20, "एकवीस": 21, "बावीस": 22,
+            "तेवीस": 23, "चोवीस": 24, "पंचवीस": 25, "सव्वीस": 26,
+            "सत्तावीस": 27, "अठ्ठावीस": 28, "एकोणतीस": 29, "तीस": 30,
+            "एकत्तीस": 31,
+        },
+        "months": {
+            "जानेवारी": 1, "फेब्रुवारी": 2, "मार्च": 3, "एप्रिल": 4,
+            "मे": 5, "जून": 6, "जुलै": 7, "ऑगस्ट": 8, "सप्टेंबर": 9,
+            "ऑक्टोबर": 10, "नोव्हेंबर": 11, "डिसेंबर": 12,
+        },
+        "year_leads": {"दोन हजार": 2000},
+        "year_units": {
+            "एक": 1, "दोन": 2, "तीन": 3, "चार": 4, "पाच": 5, "सहा": 6,
+            "सात": 7, "आठ": 8, "नऊ": 9,
+        },
+    },
+    "pa-IN": {
+        "days": {
+            "ਇੱਕ": 1, "ਦੋ": 2, "ਤਿੰਨ": 3, "ਚਾਰ": 4, "ਪੰਜ": 5, "ਛੇ": 6,
+            "ਸੱਤ": 7, "ਅੱਠ": 8, "ਨੌਂ": 9, "ਦਸ": 10, "ਗਿਆਰਾਂ": 11,
+            "ਬਾਰਾਂ": 12, "ਤੇਰਾਂ": 13, "ਚੌਦਾਂ": 14, "ਪੰਦਰਾਂ": 15,
+            "ਸੋਲਾਂ": 16, "ਸਤਾਰਾਂ": 17, "ਅਠਾਰਾਂ": 18, "ਉੱਨੀ": 19,
+            "ਵੀਹ": 20, "ਇੱਕੀ": 21, "ਬਾਈ": 22, "ਤੇਈ": 23, "ਚੌਵੀ": 24,
+            "ਪੱਚੀ": 25, "ਛੱਬੀ": 26, "ਸਤਾਈ": 27, "ਅਠਾਈ": 28,
+            "ਉਨੱਤੀ": 29, "ਤੀਹ": 30, "ਇੱਕਤੀ": 31,
+        },
+        "months": {
+            "ਜਨਵਰੀ": 1, "ਫ਼ਰਵਰੀ": 2, "ਫਰਵਰੀ": 2, "ਮਾਰਚ": 3,
+            "ਅਪ੍ਰੈਲ": 4, "ਮਈ": 5, "ਜੂਨ": 6, "ਜੁਲਾਈ": 7, "ਅਗਸਤ": 8,
+            "ਅਗਸਟ": 8, "ਸਤੰਬਰ": 9, "ਸਿਤੰਬਰ": 9, "ਅਕਤੂਬਰ": 10,
+            "ਨਵੰਬਰ": 11, "ਦਸੰਬਰ": 12,
+        },
+        "year_leads": {"ਦੋ ਹਜ਼ਾਰ": 2000, "ਦੋ ਹਜਾਰ": 2000},
+        "year_units": {
+            "ਇੱਕ": 1, "ਦੋ": 2, "ਤਿੰਨ": 3, "ਚਾਰ": 4, "ਪੰਜ": 5, "ਛੇ": 6,
+            "ਸੱਤ": 7, "ਅੱਠ": 8, "ਨੌਂ": 9,
+        },
+    },
+    "ta-IN": {
+        "days": {
+            "ஒன்று": 1, "இரண்டு": 2, "மூன்று": 3, "நான்கு": 4,
+            "ஐந்து": 5, "ஆறு": 6, "ஏழு": 7, "எட்டு": 8,
+            "ஒன்பது": 9, "பத்து": 10, "பதினொன்று": 11,
+            "பன்னிரண்டு": 12, "பதின்மூன்று": 13, "பதினான்கு": 14,
+            "பதினைந்து": 15, "பதினாறு": 16, "பதினேழு": 17,
+            "பதினெட்டு": 18, "பத்தொன்பது": 19, "இருபது": 20,
+            "இருபத்தொன்று": 21, "இருபத்திரண்டு": 22,
+            "இருபத்திமூன்று": 23, "இருபத்திநான்கு": 24,
+            "இருபத்தியைந்து": 25, "இருபத்தாறு": 26,
+            "இருபத்திஏழு": 27, "இருபத்தெட்டு": 28,
+            "இருபத்தொன்பது": 29, "முப்பது": 30, "முப்பத்தொன்று": 31,
+        },
+        "months": {
+            "ஜனவரி": 1, "பிப்ரவரி": 2, "மார்ச்": 3, "ஏப்ரல்": 4,
+            "மே": 5, "ஜூன்": 6, "ஜூலை": 7, "ஆகஸ்ட்": 8, "ஆகஸ்டு": 8,
+            "செப்டம்பர்": 9, "அக்டோபர்": 10, "நவம்பர்": 11, "டிசம்பர்": 12,
+        },
+        "year_leads": {"இரண்டு ஆயிரம்": 2000, "இரண்டு ஆயிரத்து": 2000},
+        "year_units": {
+            "ஒன்று": 1, "இரண்டு": 2, "மூன்று": 3, "நான்கு": 4,
+            "ஐந்து": 5, "ஆறு": 6, "ஏழு": 7, "எட்டு": 8, "ஒன்பது": 9,
+        },
+    },
+    "te-IN": {
+        "days": {
+            "ఒకటి": 1, "రెండు": 2, "మూడు": 3, "నాలుగు": 4, "ఐదు": 5,
+            "ఆరు": 6, "ఏడు": 7, "ఎనిమిది": 8, "తొమ్మిది": 9, "పది": 10,
+            "పదకొండు": 11, "పన్నెండు": 12, "పదమూడు": 13,
+            "పద్నాలుగు": 14, "పదిహేను": 15, "పదహారు": 16,
+            "పదిహేడు": 17, "పదియెనిమిది": 18, "పందొమ్మిది": 19,
+            "ఇరవై": 20, "ఇరవై ఒకటి": 21, "ఇరవై రెండు": 22,
+            "ఇరవై మూడు": 23, "ఇరవై నాలుగు": 24, "ఇరవై ఐదు": 25,
+            "ఇరవై ఆరు": 26, "ఇరవై ఏడు": 27, "ఇరవై ఎనిమిది": 28,
+            "ఇరవై తొమ్మిది": 29, "ముప్పై": 30, "ముప్పై ఒకటి": 31,
+        },
+        "months": {
+            "జనవరి": 1, "ఫిబ్రవరి": 2, "మార్చి": 3, "మార్చ్": 3,
+            "ఏప్రిల్": 4, "మే": 5, "జూన్": 6, "జులై": 7, "ఆగస్టు": 8,
+            "ఆగష్టు": 8, "సెప్టెంబర్": 9, "అక్టోబర్": 10, "నవంబర్": 11,
+            "డిసెంబర్": 12,
+        },
+        "year_leads": {"రెండు వెయ్యి": 2000},
+        "year_units": {
+            "ఒకటి": 1, "రెండు": 2, "మూడు": 3, "నాలుగు": 4, "ఐదు": 5,
+            "ఆరు": 6, "ఏడు": 7, "ఎనిమిది": 8, "తొమ్మిది": 9,
+        },
+    },
+}
+
+
+# ---- spoken digit words for the phone collector ------------------------------
+#
+# Zero words per locale: the single-digit 1-9 words are reused from the
+# reviewed ``_SPOKEN_DATE_TABLES`` day entries (the same words count digits
+# in these languages), so only zero needs its own explicit vocabulary. Both
+# attested spellings are listed for Punjabi, Tamil and Telugu.
+_LOCALE_ZERO_DIGIT_WORDS = {
+    "bn-IN": ["শূন্য"],
+    "gu-IN": ["શૂન્ય"],
+    "kn-IN": ["ಶೂನ್ಯ"],
+    "ml-IN": ["പൂജ്യം"],
+    "mr-IN": ["शून्य"],
+    "pa-IN": ["ਸਿਫ਼ਰ", "ਸਿਫਰ"],
+    "ta-IN": ["பூஜ்ஜியம்", "பூஜ்யம்"],
+    "te-IN": ["సున్నా", "శూన్యం"],
+}
+
+# Malayalam transliterations of the ENGLISH digit words, as STT emits them
+# when a Malayalam speaker recites digits in English ("നൈൻ ടു ടു ഫോർ ഫോർ
+# വൺ നൈൻ വൺ സീറോ ത്രീ" -> "9224419103"), mirroring the Devanagari
+# transliterated-English table. "വൺ"=1 and "ത്രീ"=3 are confirmed by that
+# browser transcript's positional decoding; the unverified forms
+# ("ഫൈവ്", "സിക്സ്", "സെവൻ") stay unmapped rather than guessed.
+# ("എട്ട്" is already the reviewed native 8.)
+_EXTRA_DIGIT_WORDS: Dict[str, Dict[str, str]] = {
+    "ml-IN": {"നൈൻ": "9", "ടു": "2", "ഫോർ": "4", "സീറോ": "0", "വൺ": "1", "ത്രീ": "3"},
+}
+
+# locale -> {digit word: digit}, explicit and independently testable.
+_LOCALE_DIGIT_WORDS = {
+    locale: {
+        **{word: str(value) for word, value in table["days"].items() if value <= 9},
+        **{word: "0" for word in _LOCALE_ZERO_DIGIT_WORDS.get(locale, [])},
+        **_EXTRA_DIGIT_WORDS.get(locale, {}),
+    }
+    for locale, table in _SPOKEN_DATE_TABLES.items()
+}
+
+# Flat lookup: every supported script's words are mutually distinct, and the
+# one shared script (Devanagari: hi-IN/mr-IN) shares words with equal values
+# ("एक" 1, "तीन" 3, "चार" 4, "सात" 7, "आठ" 8), so one merged map is
+# unambiguous.
+_ALL_LOCALE_DIGIT_WORDS = {
+    word: digit
+    for words in _LOCALE_DIGIT_WORDS.values()
+    for word, digit in words.items()
+}
+
+# A FAILED date attempt at the end of a combined name+date-of-birth answer
+# (the observed "राजू शर्मा बीस में दो हजार": the month word was
+# misrecognised, so the date cannot parse) must never contaminate the name.
+# ट्वेंटी ("twenty") is the attested transliterated multi-digit day word
+# (the live retry used it); the mapping is used ONLY by the failed-attempt
+# detector, never by date parsing itself.
+# The tail is identifiable without knowing the month: a day word (or digit)
+# followed by unparseable-month tokens and closed by a year-lead phrase
+# (with an optional unit word). The DOB itself stays unset - one bounded
+# clarification asks for the date again - and no letter or number is ever
+# invented.
+_FAILED_DATE_YEAR_LEADS = frozenset(
+    {"दो हजार", "टू थाउजंट"}  # the Hindi parser's hardcoded 2000 lead and the
+    # observed Devanagari transliteration of "two thousand"
+    | {lead for table in _SPOKEN_DATE_TABLES.values() for lead in table["year_leads"] if " " in lead}
+)
+_FAILED_DATE_UNIT_WORDS = frozenset(
+    {unit for table in _SPOKEN_DATE_TABLES.values() for unit in table["year_units"]}
+) | {"हजार"}
+
+
+_TRANSLITERATED_MULTI_DIGIT_DAY_WORDS = {"ट्वेंटी": 20}
+
+
+def _failed_date_attempt_span(text: str) -> Optional[tuple[int, int]]:
+    """Character span ``(start, end)`` of a failed date attempt at the end
+    of ``text``, or ``None``. Only a day-word-anchored tail closed by a
+    year-lead phrase qualifies; any other shape is never stripped."""
+    raw_tokens = [
+        token.strip(".,!?()\"'।")
+        for token in (text or "").replace("।", " ").split()
+    ]
+    tokens = [token.replace("़", "") for token in raw_tokens]
+    count = len(tokens)
+    if count < 3:
+        return None
+    # Find a year-lead phrase ending the utterance (allowing one trailing
+    # unit word), then walk backwards over the allowed date-attempt tokens
+    # to the day word. At least one token must precede the day (the name).
+    for lead in _FAILED_DATE_YEAR_LEADS:
+        lead_tokens = lead.split()
+        for lead_start in range(count - len(lead_tokens), -1, -1):
+            if " ".join(tokens[lead_start : lead_start + len(lead_tokens)]) != lead:
+                continue
+            walk_end = lead_start + len(lead_tokens)
+            if walk_end < count:
+                tail_unit = tokens[walk_end]
+                if tail_unit in _FAILED_DATE_UNIT_WORDS or tail_unit.isdigit():
+                    walk_end += 1
+            if walk_end != count:
+                continue  # the lead phrase must close the utterance
+            index = lead_start - 1
+            saw_day = False
+            while index >= 0:
+                token = tokens[index]
+                is_day = (
+                    token in _ALL_LOCALE_DIGIT_WORDS
+                    or token.isdigit()
+                    or token in _DEVANAGARI_NUMBERS
+                    or token in _TRANSLITERATED_DIGIT_WORDS
+                    or token in _TRANSLITERATED_MULTI_DIGIT_DAY_WORDS
+                )
+                if is_day:
+                    day_value = int(token) if token.isdigit() else int(
+_ALL_LOCALE_DIGIT_WORDS.get(
+                            token,
+                            _DEVANAGARI_NUMBERS.get(
+                                token,
+                                _TRANSLITERATED_MULTI_DIGIT_DAY_WORDS.get(
+                                    token,
+                                    int(_TRANSLITERATED_DIGIT_WORDS.get(token, 0))
+                                ),
+                            ),
+                            )
+                    )
+                    if not 1 <= day_value <= 31:
+                        break
+                    saw_day = True
+                    break
+                if token in _HINDI_MONTH_VARIANTS:
+                    index -= 1
+                    continue
+                break
+            if not saw_day or index <= 0:
+                continue  # no day word, or nothing would remain as the name
+            start_char = len(" ".join(raw_tokens[:index]))
+            if start_char:
+                start_char += 1
+            return start_char, len(text)
+    return None
+
+
+# Speech particles that STT commonly appends after the year ("पच्चीस मई दो
+# हजार है"). A particle right after "दो हजार" is filler, never part of the
+# date; it is skipped and the year unit (if any) is read after it.
+_HINDI_DATE_FILLERS = frozenset({"है"})
+
+
+
+def _ends_with_failed_date_attempt(text: str) -> bool:
+    """Whether a pending-DOB reply is a recognizable but unparseable date
+    attempt: a day word (or digit), optionally followed by the known
+    unparseable-month variants ("मे/में"), closed by a year-lead phrase
+    (with an optional unit word). The month itself is never guessed — this
+    only tells the workflow to ask a specific clarification (say the date
+    as day, month, and year) instead of the generic re-ask. Unlike
+    ``_failed_date_attempt_span`` there is no name before the day, so a
+    bare retry ("बीस में दो हजार") qualifies too."""
+    raw_tokens = [
+        token.strip(".,!?()\"'।")
+        for token in (text or "").replace("।", " ").split()
+    ]
+    tokens = [token.replace("़", "") for token in raw_tokens]
+    count = len(tokens)
+    if count < 2:
+        return False
+    for lead in _FAILED_DATE_YEAR_LEADS:
+        lead_tokens = lead.split()
+        for lead_start in range(count - len(lead_tokens), -1, -1):
+            if " ".join(tokens[lead_start : lead_start + len(lead_tokens)]) != lead:
+                continue
+            walk_end = lead_start + len(lead_tokens)
+            if walk_end < count:
+                tail_unit = tokens[walk_end]
+                if tail_unit in _FAILED_DATE_UNIT_WORDS or tail_unit.isdigit():
+                    walk_end += 1
+            if walk_end != count:
+                continue  # the lead phrase must close the utterance
+            index = lead_start - 1
+            while index >= 0:
+                token = tokens[index]
+                if (
+                    token in _ALL_LOCALE_DIGIT_WORDS
+                    or token in _DEVANAGARI_NUMBERS
+                    or token in _TRANSLITERATED_DIGIT_WORDS
+                    or token in _TRANSLITERATED_MULTI_DIGIT_DAY_WORDS
+                    or token.isdigit()
+                ):
+                    day_value = (
+                        int(token)
+                        if token.isdigit()
+                        else int(
+_ALL_LOCALE_DIGIT_WORDS.get(
+                                token,
+                                _DEVANAGARI_NUMBERS.get(
+                                    token,
+                                    _TRANSLITERATED_MULTI_DIGIT_DAY_WORDS.get(
+                                        token,
+                                        int(_TRANSLITERATED_DIGIT_WORDS.get(token, 0))
+                                    ),
+                                ),
+                                )
+                        )
+                    )
+                    if 1 <= day_value <= 31:
+                        return True
+                    break
+                if token in _HINDI_MONTH_VARIANTS:
+                    index -= 1
+                    continue
+                break
+    return False
+
+
+
+def _extract_locale_dob(
+    text: str, table: Dict[str, Dict[str, Any]]
+) -> tuple[Optional[date], Optional[str]]:
+    """A spoken date of birth for one locale table, mirroring
+    ``_extract_hindi_dob``'s conservative contract: a complete
+    "<day> <month> <year>" phrase is required; incomplete or ambiguous forms
+    yield ``(None, None)`` and nothing is ever inferred. The day and the year
+    may each be a plain digit token, because STT commonly transcribes spoken
+    numbers as digits even in Indic-script transcripts."""
+    days: Dict[str, int] = table["days"]
+    months: Dict[str, int] = table["months"]
+    year_leads: Dict[str, int] = table["year_leads"]
+    year_units: Dict[str, int] = table["year_units"]
+
+    raw_tokens = [
+        token.strip(".,!?()\"'\u0964")
+        for token in (text or "").replace("\u0964", " ").split()
+    ]
+    tokens = [
+        token.replace("\u093c", "").replace("\u09bc", "") for token in raw_tokens
+    ]
+
+    def _day_before(index: int) -> tuple[Optional[int], Optional[int]]:
+        # Longest (two-token) day form first, then the single-token form
+        # ("ఇరవై ఒకటి" vs "ఇరవై"). A digit token ("20") is the spoken day
+        # the STT wrote as a number; the caller's 1..31 check bounds it.
+        if index >= 2:
+            day = days.get(tokens[index - 2] + " " + tokens[index - 1])
+            if day is not None:
+                return day, index - 2
+        if index >= 1:
+            token = tokens[index - 1]
+            day = days.get(token)
+            if day is None and token.isdigit():
+                day = int(token)
+            if day is not None:
+                return day, index - 1
+        return None, None
+
+    def _year_from(year_start: int, month: int, day: int, day_start: int):
+        """The year beginning at ``year_start`` (a 4-digit token, or a
+        spoken lead plus optional unit), or ``None`` when it does not
+        form a complete valid date with the day and month."""
+        if year_start >= len(tokens):
+            return None
+        year_token = tokens[year_start]
+        digit_year = year_token.isdigit() and len(year_token) == 4
+        base = None
+        lead_end = None
+        if digit_year:
+            base = int(year_token)
+            lead_end = year_start
+        else:
+            two = " ".join(tokens[year_start : year_start + 2])
+            if two in year_leads:
+                base = year_leads[two]
+                lead_end = year_start + 1
+            elif year_token in year_leads:
+                base = year_leads[year_token]
+                lead_end = year_start
+        if base is None:
+            return None
+        # An optional unambiguous unit word follows the year lead
+        # ("… two thousand five"): 2001-2009 only. An exact digit year is
+        # already complete, so no unit is ever added to it.
+        unit = 0
+        if not digit_year and lead_end + 1 < len(tokens):
+            unit_two = " ".join(tokens[lead_end + 1 : lead_end + 3])
+            if unit_two in year_units:
+                unit = year_units[unit_two]
+                lead_end = lead_end + 2
+            elif tokens[lead_end + 1] in year_units:
+                unit = year_units[tokens[lead_end + 1]]
+                lead_end = lead_end + 1
+        year = base + unit
+        if not _dob_year_ok(year):
+            return None
+        try:
+            parsed = date(year, month, day)
+        except ValueError:
+            return None
+        return parsed, " ".join(raw_tokens[day_start : lead_end + 1])
+
+    for index, token in enumerate(tokens):
+        month = months.get(token)
+        if month is None:
+            continue
+        # Order A (the documented "<day> <month> <year>"): the day
+        # precedes the month.
+        day, day_start = _day_before(index)
+        if day is not None and 1 <= day <= 31 and index + 1 < len(tokens):
+            resolved = _year_from(index + 1, month, day, day_start)
+            if resolved is not None:
+                return resolved
+        # Order B (month-first, the observed Marathi "<month> <day> <year>"
+        # answer): the day follows the month and the year follows the day,
+        # with the same conservative year rules; nothing is ever guessed.
+        # The verbatim span starts at the month token, mirroring Order A's
+        # month-inclusive span.
+        if index + 1 < len(tokens):
+            token_after = tokens[index + 1]
+            day_after = days.get(token_after)
+            if day_after is None and token_after.isdigit():
+                day_after = int(token_after)
+            if (
+                day_after is not None
+                and 1 <= day_after <= 31
+                and index + 2 < len(tokens)
+            ):
+                resolved = _year_from(index + 2, month, day_after, index)
+                if resolved is not None:
+                    return resolved
+    return None, None
+
+
 def _extract_dob_date(text: str) -> tuple[Optional[date], Optional[str]]:
     """Return the calendar date of birth found in ``text`` and its verbatim form.
 
@@ -1001,6 +1938,13 @@ def _extract_dob_date(text: str) -> tuple[Optional[date], Optional[str]]:
     invented. Implausible values (unknown month, day/month out of range, year
     outside 1900..current year) are rejected rather than guessed at.
     """
+    hindi_dob, hindi_verbatim = _extract_hindi_dob(text)
+    if hindi_dob is not None:
+        return hindi_dob, hindi_verbatim
+    for table in _SPOKEN_DATE_TABLES.values():
+        locale_dob, locale_verbatim = _extract_locale_dob(text, table)
+        if locale_dob is not None:
+            return locale_dob, locale_verbatim
     match = _DOB_MONTH_DATE.search(text)
     if match is not None:
         month = _MONTH_NAMES.get(match.group(2).lower().rstrip("."))
@@ -1056,15 +2000,26 @@ def _extract_dob_date(text: str) -> tuple[Optional[date], Optional[str]]:
                 return parsed, match.group(0)
     # Spoken-English form ("twenty seven may two thousand"). Every component
     # must parse; nothing is guessed and only the parsed components are kept.
-    for match in _SPOKEN_DOB.finditer(text):
+    # A rejected candidate must not consume an overlapping one: the greedy
+    # two-word day group can swallow a lead-in word ("…is twenty May two
+    # thousand" first matches with day "is twenty"), so the search restarts
+    # one character later and the true date is examined next. Validation is
+    # unchanged - only fully valid candidates are ever returned.
+    pos = 0
+    while True:
+        match = _SPOKEN_DOB.search(text, pos)
+        if match is None:
+            break
         day = _spoken_day(match.group(1))
         month = _MONTH_NAMES.get(match.group(2).lower())
         year, year_text = _spoken_year(match.group(3))
         if day is None or month is None or year is None or not _dob_year_ok(year):
+            pos = match.start() + 1
             continue
         try:
             parsed = date(year, month, day)
         except ValueError:
+            pos = match.start() + 1
             continue
         return parsed, f"{match.group(1)} {match.group(2)} {year_text}"
     return None, None
@@ -1301,6 +2256,42 @@ def _clean_name_value(text: str) -> str:
         value,
         count=1,
     )
+    # Hindi wrappers, mirroring the correction-path patterns in the workflow
+    # (_HINDI_NAME_LEAD / _HINDI_NAME_TRAIL): a leading affirmative, the
+    # "मेरा नाम ..." lead and a trailing "है" are never part of the name
+    # ("ज़रूर मेरा नाम बिट्टू जोरदार है" -> "बिट्टू जोरदार"). The lead also
+    # covers the "है" form ("मेरा नाम है राजू…"), its glued speech-recognition
+    # variant ("नामहै"), and common insertions ("मेरा सही नाम राजू…"); the
+    # same pattern lives in the workflow's correction cleaner.
+    value = re.sub(
+        r"^\s*(?:जी[,\s]+)?(?:ज़रूर|जरूर)\s*[,\s]*",
+        "",
+        value,
+        count=1,
+    )
+    value = re.sub(
+        r"^(?:जी[,\s]+)?(?:मेरा\s+)?(?:सही\s+|शुद्ध\s+|सही\s+वाला\s+)?नाम\s*(?:है|हैं)?(?:[\s,]+|$)",
+        "",
+        value,
+        count=1,
+    )
+    value = re.sub(r"\s+है[.!?।]*$", "", value)
+    # Malayalam name lead: "എന്റെ പേരാണ് രാജു …" -> "രാജു …" (the observed
+    # glued form "പേരാണ്", the bare "പേര്" lead, and the standard
+    # "പേര് ആണ്" are all stripped, including the chillu spellings).
+    value = re.sub(r"^\s*എൻ്റെ\s+പേരാണ്\s*", "", value, count=1)
+    value = re.sub(r"^\s*എൻ്റെ\s+പേര്\s*", "", value, count=1)
+    value = re.sub(r"^\s*എന്റെ\s+പേരാണ്\s*", "", value, count=1)
+    value = re.sub(r"^\s*എന്റെ\s+പേര്\s*", "", value, count=1)
+    value = re.sub(r"^\s*എന്റെ\s+പേര്\s*ആണ്\s*", "", value, count=1)
+    # Marathi name lead: "माझं नाव Raju Patil आहे" -> "Raju Patil" (the
+    # possessive leads "माझं/माझे/माझा" and the trailing copula "आहे" are
+    # never part of the name; mixed-script names keep every Latin letter
+    # and native-script letter of the name itself).
+    value = re.sub(r"^\s*माझं\s+नाव\s*", "", value, count=1)
+    value = re.sub(r"^\s*माझे\s+नाव\s*", "", value, count=1)
+    value = re.sub(r"^\s*माझा\s+नाव\s*", "", value, count=1)
+    value = re.sub(r"\s+आहे[.!?।]*$", "", value)
     return value.strip().rstrip(" .!?")
 
 
@@ -1323,13 +2314,12 @@ def _parse_answer(text: str, allow_bare_dob: bool = False) -> Dict[str, Any]:
         record("contact_email", email)
 
     if _PHONE.fullmatch(stripped):
-        record(
-            "contact_phone",
-            stripped if stripped.isdigit() else "".join(_DIGITS.findall(stripped)),
-        )
+        candidate = stripped if stripped.isdigit() else "".join(_DIGITS.findall(stripped))
+        if _is_plausible_phone(candidate):
+            record("contact_phone", candidate)
     else:
         spoken_phone = _extract_spoken_phone(stripped)
-        if spoken_phone:
+        if spoken_phone and _is_plausible_phone(spoken_phone):
             record("contact_phone", spoken_phone)
 
     if "consent" in lowered:
@@ -1455,14 +2445,18 @@ def _parse_for_pending_field(field_key: str, text: str) -> Dict[str, Any]:
         if field_key == "contact_email":
             return {"contact_email": email} if email else {}
         if field_key in ("contact_phone", "reporter_contact_phone"):
-            if len(digits) >= _MIN_PHONE_DIGITS:
+            if len(digits) >= _MIN_PHONE_DIGITS and _is_plausible_phone(digits):
                 return {field_key: digits}
-            return {field_key: spoken_phone} if spoken_phone else {}
+            if spoken_phone and _is_plausible_phone(spoken_phone):
+                return {field_key: spoken_phone}
+            return {}
         if email:
             return {"contact_email": email}
-        if len(digits) >= _MIN_PHONE_DIGITS:
+        if len(digits) >= _MIN_PHONE_DIGITS and _is_plausible_phone(digits):
             return {"contact_phone": digits}
-        return {"contact_phone": spoken_phone} if spoken_phone else {}
+        if spoken_phone and _is_plausible_phone(spoken_phone):
+            return {"contact_phone": spoken_phone}
+        return {}
     if field_key == "contact_method":
         if (
             "both" in lowered
@@ -1578,6 +2572,12 @@ def _parse_for_pending_field(field_key: str, text: str) -> Dict[str, Any]:
             return {"product": other_medicine}
         if _UNKNOWN_ANSWER.search(lowered):
             return {"product": "Unknown (to be confirmed)"}
+        # A reply in a supported Indic script that names no recognised
+        # medicine is unclear speech, never a confirmed different medicine:
+        # return nothing so the bounded product clarification/re-ask runs and
+        # the case parks for human review instead of terminating out-of-scope.
+        if _INDIC_SCRIPT_REPLY.search(stripped):
+            return {}
         if _NON_ANSWER.match(stripped) or _SIMPLE_YESNO.match(stripped):
             return {}
         # An uncertain or question-shaped reply is not a product name: ask
@@ -1623,6 +2623,21 @@ def _parse_for_pending_field(field_key: str, text: str) -> Dict[str, Any]:
                     return {}
                 cleaned = cleaned.replace(dob_value, "").strip(" ,;-&")
             cleaned = _DOB_NAME_LEAD.sub("", cleaned).strip(" ,;-&")
+            cleaned = _HINDI_DOB_NAME_TAIL.sub("", cleaned).strip(" ,;-&")
+            # Re-run the cleaner after the split so wrappers exposed by it
+            # ("… है और मेरा जन्मदिन …" -> "… है") are stripped too; the
+            # cleaner is idempotent for already-clean values.
+            cleaned = _clean_name_value(cleaned)
+            if not dob_value:
+                # A FAILED date attempt (the observed "राजू शर्मा बीस में
+                # दो हजार": the month word was misrecognised) is never part
+                # of the name: the day-word + year-lead tail is stripped,
+                # the name stays intact, and the date of birth remains
+                # unset for one bounded clarification (day, month, year) —
+                # nothing is invented.
+                span = _failed_date_attempt_span(cleaned)
+                if span:
+                    cleaned = _clean_name_value(cleaned[: span[0]].strip())
             return {field_key: cleaned} if cleaned else {}
         return {field_key: stripped}
     return {}

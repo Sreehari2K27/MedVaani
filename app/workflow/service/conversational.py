@@ -13,10 +13,16 @@ from app.providers.base import LLMProvider, LLMResult
 from app.providers.answer import (
     _AFFIRM,
     _EXPLICIT_CORRECTION,
+    _MIN_PHONE_DIGITS,
     _NEGATION,
+    _is_plausible_phone,
+    _ends_with_failed_date_attempt,
     _NON_ANSWER,
+    _REPORT_LANGUAGE,
     _SIMPLE_YESNO,
+    _SYMPTOM_LANGUAGE,
     _UNKNOWN_ANSWER,
+    _extract_spoken_phone,
     _known_other_medicine,
     _normalize_product,
     _normalize_spoken_email,
@@ -26,6 +32,7 @@ from app.providers.answer import (
 from app.safety import SafetyLayer, SafetyResult, SafetySignal
 from app.workflow.onset import (
     format_iso_date,
+    is_recognizable_onset,
     normalize_onset_statement,
     resolve_reference,
 )
@@ -54,6 +61,26 @@ class WorkflowTurnResult:
     response_text: str = ""
     completed: bool = False
     next_question: Optional[List[str]] = None
+
+
+def _event_description_may_be_unclear(description: str | None) -> bool:
+    """Whether a preserved event description may be unclear speech (Option B).
+
+    A short description carrying no recognized symptom or report cue in any
+    supported language may be unclear/garbled speech — as seen in the live
+    Malayalam transcript. The captured wording is always preserved verbatim
+    and never rewritten, translated, or clinically interpreted here; this
+    only tells the human reviewer that the description's reliability is
+    limited. Long descriptions and anything matching a recognized cue stay
+    unflagged.
+    """
+    text = (description or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if _SYMPTOM_LANGUAGE.search(lowered) or _REPORT_LANGUAGE.search(lowered):
+        return False
+    return len(text.split()) <= 4
 
 
 def _field_map_from_llm(llm_result: LLMResult) -> Dict[str, Any]:
@@ -170,13 +197,52 @@ DETAILS_CORRECTION_CLARIFICATION = (
 # date: ask only for the missing date, never restarting the whole question.
 INCOMPLETE_DOB_CLARIFICATION = "Sorry, please tell me a full date of birth."
 
+# The specific re-ask when a reply to the DOB question is a recognizable
+# but unparseable date attempt (a day word and a year lead with the month
+# misrecognised — the observed "बीस में दो हजार"): name what failed instead
+# of repeating the generic question, and never guess the month.
+INCOMPLETE_DATE_MONTH_CLARIFICATION = (
+    "I could not hear the month clearly - please say the date of birth as "
+    "day, month, and year."
+)
+
 # Field-choice phrases on the details-correction turn ("date of birth",
 # "the date", "the name"). A value that actually parses as a date is handled
 # as a corrected date before these are consulted.
 _DOB_CHOICE = re.compile(
     r"(?i)\b(?:date\s+of\s+birth|birth\s+date|dob|birth|the\s+date|date)\b"
+    # The DOB labels each supported locale's own flow uses (established
+    # project phrases, not invented). Bare Indic tokens: no \b for Indic
+    # scripts, mirroring the documented rule.
+    r"|ജന്മതിഥി|ജന്മദിനം"
+    r"|জন্ম\s+তারিখ|জন্মদিন"
+    r"|જન્મ\s+તારીખ|જન્મદિન"
+    r"|ಜನ್ಮ\s+ದಿನಾಂಕ|ಹುಟ್ಟಿದ\s+ದಿನ"
+    r"|जन्मतारीख|जन्मदिन"
+    r"|ਜਨਮ\s+ਤਾਰੀਖ|ਜਨਮਦਿਨ"
+    r"|பிறந்த\s+தேதி|பிறந்தநாள்"
+    r"|పుట్టిన\s+తేదీ|జన్మ\s+దినం"
 )
-_NAME_CHOICE = re.compile(r"(?i)\b(?:the\s+)?name\b")
+# Field-choice replies: the English "name" cue, plus the Hindi forms
+# "नाम गलत था", "नाम गलत है", "नाम गलत था मेरा" and bare "नाम" — all name
+# THE FIELD to correct, never a corrected value. Both Hindi forms are
+# anchored to the whole reply's start, so a real corrected name
+# ("मेरा सही नाम राजू रस्तोगी है") still falls through to the value path.
+# The name labels of the other supported locales (established project
+# phrases) are added as bare-token alternatives.
+_NAME_CHOICE = re.compile(
+    r"(?i)\b(?:the\s+)?name\b"
+    r"|^\s*नाम\s+गलत\b.*$"
+    r"|^\s*नाम\s*[.!?]?\s*$"
+    r"|^\s*പേര്\b|^\s*പേര്\s*[.!?]?\s*$"
+    r"|^\s*নাম\s*[.!?]?\s*$"
+    r"|^\s*નામ\s*[.!?]?\s*$"
+    r"|^\s*ಹೆಸರು\s*[.!?]?\s*$"
+    r"|^\s*नाव\s*[.!?]?\s*$"
+    r"|^\s*ਨਾਮ\s*[.!?]?\s*$"
+    r"|^\s*பெயர்\s*[.!?]?\s*$"
+    r"|^\s*పేరు\s*[.!?]?\s*$"
+)
 
 # A reply that says the captured email is wrong without supplying a new
 # address ("the email address is incorrect").
@@ -210,8 +276,9 @@ EMAIL_OFFER_QUESTION = (
     "May I have the patient's email address, if available?"
 )
 EMAIL_REQUEST_QUESTION = (
-    "Could you please spell out your email address, one letter or number at a "
-    "time? You can say 'at the rate' for @ and 'dot' for a period."
+    "Could you please spell out your email address, one letter or number at "
+    "a time, with a short pause between letters? You can say 'at the rate' "
+    "for @ and 'dot' for a period."
 )
 
 # Step 9 - severity / life-threatening screen.
@@ -297,6 +364,25 @@ _CLARIFY_PHRASE = re.compile(
     r"|दोबारा|समझ\s+नहीं\s+आया|क्या)"
 )
 
+# A bare "say that again" reply ("dobara kahiye", "repeat", "pardon", "फिर
+# से") asks for the current question to be repeated. It is answered by
+# re-asking WITHOUT consuming the field's clarification bound, so a repeat
+# request never parks the interview by itself. Matched against the whole
+# reply only: an answer that merely contains "again" ("it happened again
+# yesterday") keeps its normal treatment.
+_REPEAT_REQUEST = re.compile(
+    r"(?i)^\s*(?:"
+    r"say\s+(?:it|that)(?:\s+again)?"
+    r"|repeat(?:\s+(?:it|that|please))?"
+    r"|again|once\s+more|come\s+again|pardon"
+    r"|remind\s+me"
+    r"|i\s+(?:didn'?t|did\s+not)\s+(?:get|catch|hear)(?:\s+(?:it|that))?"
+    r"|dobara(?:\s+kahiye|\s+bolo|\s+boliye)?"
+    r"|दोबारा(?:\s+कहिए|\s+बोलिए)?"
+    r"|फिर(?:\s+से)?(?:\s+कहिए|\s+बोलिए)?"
+    r")\s*[.?!]?\s*$"
+)
+
 # "no, it's Beta Jones" -> the correction payload is everything after the no.
 _NEGATION_LEAD = re.compile(
     r"(?i)^\s*(?:no|nope|not\s+really|incorrect)[,\s]+"
@@ -310,25 +396,69 @@ _VALUE_LEAD = re.compile(
 
 # Hindi name wrappers, stripped by ``_clean_correction`` so a fuller
 # correction reads back as the name itself: "जी, मेरा नाम जया बच्चन है"
-# -> "जया बच्चन".
-_HINDI_NAME_LEAD = re.compile(r"^(?:जी[,\s]+)?(?:मेरा\s+नाम|नाम)\s+")
+# -> "जया बच्चन". Same pattern as the first-capture cleaner in
+# app/providers/answer.py (_clean_name_value): covers "मेरा नाम है …",
+# "नाम है …", the glued "नामहै" and insertions like "मेरा सही नाम …".
+_HINDI_NAME_LEAD = re.compile(
+    r"^(?:जी[,\s]+)?(?:मेरा\s+)?(?:सही\s+|शुद्ध\s+|सही\s+वाला\s+)?नाम\s*(?:है|हैं)?(?:[\s,]+|$)"
+)
 _HINDI_NAME_TRAIL = re.compile(r"\s+है$")
 
 # A leading affirmative token, so a value hiding after it can be inspected:
 # "yes alpha beta" is not the same reply as "yes". Hindi forms are stripped
 # here too so "haan"/"ji haan" confirm a read-back instead of reading as a
-# possible corrected value.
+# possible corrected value. The Hindi leads sit in their own branch because
+# the chandrabindu/matras are not word characters and cannot sit inside the
+# \b-guarded group ("हाँ सही पकड़े हैं" must shed its leading "हाँ").
 _AFFIRM_LEAD = re.compile(
-    r"(?i)^\s*(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|fine|confirmed"
-    r"|ji haan|haan|han)"
-    r"\b[\s,]*"
+    r"(?i)^\s*(?:(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|fine|confirmed"
+    r"|ji haan|haan|han)\b"
+    r"|जी\s+हाँ|जी\s+हां|हाँ|हां"
+    # Malayalam affirmation leads ("അതെ തന്നെ" must shed its lead so the
+    # "തന്നെ" tail can confirm the pending question). "യെസ്"/"യസ്" are the
+    # Malayalam-script transliterations of spoken "yes" the browser STT
+    # emits ("യെസ് ശരിയാണ്" must shed its lead the same way). "hoy"/"ho"/
+    # "barobar" are the Latin-script transliterations of the Marathi
+    # affirmatives ("hoy te barobar aahe" sheds its lead the same way).
+    r"|അതെ|യെസ്|യസ്)"
+    r"|^\s*(?:(?:hoy|ho|barobar)\b)"
+    # Devanagari Marathi leads, longest first ("होय" must win over "हो" so
+    # the remainder never starts with a stray matra): "होय बरोबर आहे" and
+    # "होय देतोय मी" shed their leads the same way.
+    r"|^\s*(?:होय|बरोबर|हो)(?![\u0900-\u097F])"
+    r"[\s,]*"
 )
 # Continuations that turn the remainder back into a plain affirmation
-# ("yes it is", "yes I am sure that's right").
+# ("yes it is", "yes I am sure that's right"). The Hindi branch covers the
+# "you've got it right" idiom ("हाँ सही पकड़े हैं") and plain agreement
+# tails after a leading affirmative; negations are checked before this is
+# ever consulted, so a negative reply can never be swallowed by it.
 _AFFIRM_CONTINUATION = re.compile(
-    r"(?i)^\s*(?:i\s*'?m|i\s+am|it(?:'s|\s+is)|that(?:'s|\s+is)|we(?:'re|\s+are)"
+    r"(?i)^\s*(?:(?:i\s*'?m|i\s+am|it(?:'s|\s+is)|that(?:'s|\s+is)|we(?:'re|\s+are)"
     r"|you(?:'re|\s+are)|you\s+got\s+it|got\s+it|isn'?t|indeed|thanks?|thank\s+you"
     r"|please|correct|right|fine|ok|okay|sure|true)\b"
+    # "the same one" tails after a leading affirmative: "हाँ वही है" /
+    # "haan wahi hai" confirm the pending question rather than offering a
+    # corrected value (negations are checked before this is ever consulted).
+    # The Malayalam "തന്നെ" ("exactly/the same one") is the same idiom:
+    # "അതെ തന്നെ" confirms after its lead is shed, and the Marathi "ते"
+    # ("that") plays the same role in "होय ते बरोबर आहे" / "hoy te barobar
+    # aahe" after the "होय"/"hoy" lead is shed.
+    r"|सही\s+पकड़\S*(?:\s+हैं?)?|ठीक\s+है|बिल्कुल|सहमत"
+    r"|തന്നെ"
+    r"|वही(?:\s+हैं?)?|wahi(?:\s+hai)?)"
+    r"|^\s*(?:te|barobar)\b"
+    # Devanagari Marathi agreement tails after a shed lead: "होय बरोबर
+    # आहे" sheds "होय" and the remainder "बरोबर आहे" ("that's right")
+    # confirms; "होय देतोय मी" ("yes, I am giving it") sheds its lead and
+    # the "देतोय" volunteering tail confirms the same way. The lookahead
+    # keeps the token from matching inside a longer Devanagari word.
+    r"|^\s*(?:बरोबर(?:\s+आहे)?|देतोय)(?![\u0900-\u097F])"
+    # Hindi polite/pointer particles after a shed affirmative lead: "हाँ जी
+    # सही है" / "हाँ यह सही है" are plain agreements once the हाँ lead is
+    # shed — the same idiom as the English "that is" tail. Negations are
+    # checked before this is ever consulted.
+    r"|^\s*(?:जी|यह)(?![\u0900-\u097F])"
 )
 
 
@@ -382,11 +512,19 @@ def _looks_like_value(text: str) -> bool:
     candidate = text.strip()
     if len(candidate) < 3 or len(candidate.split()) > 6:
         return False
-    # A plausible name carries script letters: Latin, or Devanagari letters
-    # (vowels/consonants only — not digits or signs), so Indic-script name
-    # corrections are recognised while arbitrary non-name strings (pure
-    # digits, punctuation, other scripts) stay excluded.
-    if not re.search(r"[A-Za-z\u0904-\u0939\u0958-\u0961]", candidate):
+    # A plausible name carries script letters: Latin, or letters of the
+    # supported Indic scripts (Devanagari, Bengali, Gurmukhi, Gujarati,
+    # Kannada, Malayalam, Tamil, Telugu — vowels/consonants only, not digits
+    # or signs), so Indic-script name corrections are recognised while
+    # arbitrary non-name strings (pure digits, punctuation, other scripts)
+    # stay excluded. Recognising a script never confirms anything: this only
+    # classifies a reply as a possible corrected value.
+    if not re.search(
+        r"[A-Za-z\u0904-\u0939\u0958-\u0961"
+        r"\u0985-\u09B9\u0A05-\u0A39\u0A85-\u0AB9"
+        r"\u0B85-\u0BB9\u0C05-\u0C39\u0C85-\u0CB9\u0D05-\u0D39]",
+        candidate,
+    ):
         return False
     if (
         _NON_ANSWER.match(candidate)
@@ -407,6 +545,22 @@ def _looks_like_contact_number(text: str) -> bool:
     if not re.fullmatch(r"[\d\s\-().+]{7,}", candidate):
         return False
     return len(re.sub(r"\D", "", candidate)) >= 7
+
+
+def _possible_phone_value(text: str) -> bool:
+    """Whether a reply could still be a corrected phone number.
+
+    Literal digits at the confirmable length, or a complete spoken digit
+    run - the same threshold the restatement path applies while a phone
+    read-back is pending. A words-only reply ("the number is correct",
+    "അത് ശരിയാണ്"-style echoes) can never be a corrected number, so it
+    must not mask a confirmation.
+    """
+    candidate = text or ""
+    digits = "".join(re.findall(r"\d+", candidate))
+    if len(digits) >= _MIN_PHONE_DIGITS:
+        return True
+    return _extract_spoken_phone(candidate) is not None
 
 
 def _classify_confirmation_turn(
@@ -440,12 +594,15 @@ def _classify_confirmation_turn(
     def _is_value_correction(candidate: str) -> bool:
         if not candidate:
             return False
+        # A phone number can only be corrected by digits (literal or a
+        # complete spoken digit run - the restatement path upstream already
+        # maps spoken words): a letters-only mumble can never replace a
+        # pending number candidate.
+        if field in ("contact_phone", "reporter_contact_phone"):
+            return _looks_like_contact_number(candidate)
         if _looks_like_value(candidate):
             return True
-        return field in (
-            "contact_phone",
-            "reporter_contact_phone",
-        ) and _looks_like_contact_number(candidate)
+        return False
 
     lead = _NEGATION_LEAD.match(stripped)
     if lead:
@@ -461,8 +618,17 @@ def _classify_confirmation_turn(
     negate = bool(_NEGATION.search(stripped))
     if affirm and not negate:
         if _affirm_with_value_replied(stripped):
-            # "yes alpha beta" may be a correction: clarify rather than
-            # silently accept a value in either direction.
+            # A phone number cannot be corrected with words alone: for a
+            # pending phone read-back, an affirmative reply whose remainder
+            # carries no plausible number is a plain confirmation ("the
+            # number is correct" / Malayalam or Tamil echo replies), never
+            # an ambiguous number answer. A reply that does carry a
+            # plausible number still clarifies, so a genuine spoken
+            # correction is never swallowed by a "yes".
+            if field in ("contact_phone", "reporter_contact_phone") and not (
+                _possible_phone_value(stripped)
+            ):
+                return "yes", "yes"
             return "ambiguous", ""
         return "yes", "yes"
     if negate and not affirm:
@@ -482,6 +648,43 @@ def _clarification_for(field_name: str, awaiting_correction: bool) -> str:
     return (
         "Sorry, I didn't catch that - please say yes if that's correct, "
         "or no if you'd like me to change it."
+    )
+
+
+def _unchanged_email_clarification(candidate: str) -> str:
+    """What the person hears when a bare affirmation tries to confirm the
+    exact email address they just rejected: the value is named and a fresh
+    spelling is requested - a rejected candidate is never confirmed
+    unchanged."""
+    return (
+        f"The address still reads as {candidate}. "
+        "If that is not correct, please spell it out again, one letter or "
+        "number at a time."
+    )
+
+
+def _is_truncated_email_candidate(candidate: str, rejected: str) -> bool:
+    """Whether a re-spelled email looks like a truncated transcription of
+    the address the reporter just rejected: the same domain with the new
+    local part being a strict prefix of the rejected local part - the
+    classic "transcription dropped the tail" signature. This is concrete
+    evidence of possible incompleteness, never proof of a wrong address."""
+    local, sep, domain = candidate.partition("@")
+    rejected_local, _, rejected_domain = rejected.partition("@")
+    if not sep or not local or domain != rejected_domain:
+        return False
+    return local != rejected_local and rejected_local.startswith(local)
+
+
+def _incomplete_email_clarification(candidate: str) -> str:
+    """What the person hears when a bare affirmation tries to confirm a
+    re-spelling that looks truncated relative to the address they just
+    rejected: the value is named and an explicit completeness confirmation
+    is requested before anything is committed."""
+    return (
+        f"The address reads as {candidate}. "
+        "If that is the complete address, say yes - if more letters belong "
+        "to it, please spell the address again."
     )
 
 
@@ -524,8 +727,11 @@ _REVIEW_FALLBACK_FIELDS: Dict[str, str] = {
 # Fields whose repeated non-answers park the case for human review with the
 # field left genuinely empty (audit step 3): an event description or a
 # suspected medicine is never fabricated, and its clarification loop must
-# stay bounded exactly like _REVIEW_FALLBACK_FIELDS.
-_REVIEW_ONLY_FIELDS = frozenset({"adverse_event", "product"})
+# stay bounded exactly like _REVIEW_FALLBACK_FIELDS. The reporter's role has
+# no safe default (unlike an unknown age, "self"/"someone_else" cannot be
+# guessed), so an unresolved role question is parked with the role unset for
+# the human reviewer to resolve.
+_REVIEW_ONLY_FIELDS = frozenset({"adverse_event", "product", "reporter_role"})
 
 # Hard bound on failed read-back attempts per confirmation field: every turn
 # that starts with a pending confirmation and does not commit a value counts
@@ -643,6 +849,27 @@ class ConversationalAEWorkflow:
         # so a stuck confirmation loop parks the report for human review
         # instead of looping forever. Counters reset when a value commits.
         self._confirmation_attempts: Dict[str, int] = {}
+        # The field whose read-back was parked at the attempt bound, when
+        # the park came from the read-back loop (never from urgent or
+        # safety escalations). While it is set, a later turn that re-engages
+        # the field (a corrected candidate or a successful confirmation)
+        # resumes the interview instead of leaving it parked forever.
+        self._review_parked_field: Optional[str] = None
+        # The email address the reporter explicitly rejected at its read-back.
+        # While it is set, a bare affirmation can never confirm a NEW
+        # candidate that spells exactly the same rejected value: the
+        # reporter must supply a different spelling (or the loop stays
+        # bounded and the optional email is left unprovided) so a rejected
+        # address can never be silently confirmed - the reported
+        # data-integrity defect.
+        self._rejected_email_candidate: Optional[str] = None
+        # The email candidate that an explicit completeness question is
+        # waiting on: a re-spelling that looks truncated relative to the
+        # rejected candidate may not be confirmed by a bare affirmation -
+        # the first affirmative raises the completeness question, and only
+        # the reporter's explicit resolution (a further affirmative after
+        # the question, or a new spelling) commits anything.
+        self._email_pending_completeness: Optional[str] = None
         # A conflicting DOB/age answer holds both raw values until the
         # reporter clarifies which one to record.
         self._dob_age_conflict: Optional[Dict[str, str]] = None
@@ -729,6 +956,8 @@ class ConversationalAEWorkflow:
         except AECaseError:
             pass
         self._confirmation_attempts.pop("contact_email", None)
+        self._rejected_email_candidate = None
+        self._email_pending_completeness = None
         self._email_offer_pending = False
         self._email_request_pending = False
 
@@ -757,6 +986,18 @@ class ConversationalAEWorkflow:
         if description_captured:
             return []
         return [INTRODUCTION_MESSAGE]
+
+    def mark_introduction_shown(self) -> None:
+        """Mark Step 1's fixed introduction as already delivered.
+
+        Called by the voice-first greeting endpoint when the client has
+        displayed (and spoken) the approved opening itself, before the first
+        utterance is processed, so that utterance is never answered with a
+        second copy of the introduction. Presentation only: case state,
+        question order, confirmations, consent, safety escalation and
+        completion behaviour are untouched.
+        """
+        self._introduction_shown = True
 
     def _additional_info_due(self) -> bool:
         """Step 10B.2 is reached once the severity screen and the incident
@@ -1135,6 +1376,31 @@ class ConversationalAEWorkflow:
         repeated_dob = None
         if confirmation_active and pending_field == "patient_identifier":
             repeated_dob = normalized_dob_in(message)
+        repeated_phone = None
+        if confirmation_active and pending_field in (
+            "contact_phone",
+            "reporter_contact_phone",
+        ):
+            # A phone number restated (or corrected) while its read-back is
+            # pending is the corrected value, never an ambiguous reply:
+            # literal digits first, then a complete spoken digit run. The
+            # same length-plausibility validation as the capture path
+            # applies, so no short/unverified or implausibly long sequence
+            # can override the candidate.
+            digits = "".join(re.findall(r"\d+", message or ""))
+            if len(digits) >= _MIN_PHONE_DIGITS and _is_plausible_phone(digits):
+                repeated_phone = digits
+            else:
+                spoken = _extract_spoken_phone(message or "")
+                if _is_plausible_phone(spoken or ""):
+                    repeated_phone = spoken
+        repeated_email = None
+        if confirmation_active and pending_field == "contact_email":
+            # A dictated address repeated/corrected while its read-back is
+            # pending is the corrected value (mirrors repeated_phone); full
+            # email/TLD validation applies and the NEW candidate is still
+            # only committed after its own explicit confirmation.
+            repeated_email = _normalize_spoken_email(message)
         if self._correction_target is not None:
             # Only the chosen detail is being corrected: a full date updates
             # the date of birth (the name stays), a name-like value updates
@@ -1144,6 +1410,20 @@ class ConversationalAEWorkflow:
             handled_by_details_flow = True
             dob_value = normalized_dob_in(message)
             verdict, payload = _classify_confirmation_turn(message, pending_field)
+            if verdict == "ambiguous" and self._correction_target == "name":
+                # An affirmation sitting INSIDE a plausible corrected name
+                # ("मेरा सही नाम राजू रस्तोगी है") reads as an unclear reply to
+                # the shared classifier. When nothing leads the reply, the
+                # cleaned value IS the corrected name. Leading-affirmation
+                # replies ("हाँ …") and short mumblers stay ambiguous and are
+                # clarified instead of overwriting a valid candidate.
+                candidate = _clean_correction(message)
+                if (
+                    _looks_like_value(candidate)
+                    and len(candidate.split()) >= 2
+                    and not _AFFIRM_LEAD.match(message)
+                ):
+                    verdict, payload = "correction", candidate
             if dob_value is not None:
                 try:
                     self.engine.update("patient_age", dob_value)
@@ -1264,6 +1544,50 @@ class ConversationalAEWorkflow:
             applied_any = True
             handled_by_details_flow = True
             self._confirmation_attempts.pop("patient_identifier", None)
+        elif confirmation_active and repeated_phone is not None:
+            # A phone number corrected/restated while its read-back is
+            # pending replaces the pending candidate and starts a fresh
+            # read-back; an earlier incomplete candidate is never committed
+            # instead of it. The explicit confirmation of the NEW candidate
+            # is still required before anything is written to the case.
+            try:
+                self.engine.respond_to_confirmation(repeated_phone)
+                applied_any = True
+                self._confirmation_attempts.pop(pending_field, None)
+            except AECaseError:
+                pass
+            confirmation_handled = True
+            handled_by_details_flow = True
+        elif confirmation_active and repeated_email is not None:
+            # A dictated address repeated/corrected while its read-back is
+            # pending replaces the candidate via a fresh read-back; an
+            # earlier candidate is never committed instead of it, and the
+            # explicit confirmation of the new candidate is still required.
+            try:
+                self.engine.respond_to_confirmation(repeated_email)
+                applied_any = True
+                self._confirmation_attempts.pop(pending_field, None)
+            except AECaseError:
+                pass
+            if repeated_email != self._rejected_email_candidate:
+                if not _is_truncated_email_candidate(
+                    repeated_email, self._rejected_email_candidate or ""
+                ):
+                    # A different spelling that is not itself a truncation
+                    # of the rejected address resolves the earlier
+                    # rejection. A truncated re-spelling keeps the ORIGINAL
+                    # rejected value as the memory: it is exactly the
+                    # evidence the confirmation guard needs (a bare
+                    # affirmative must then raise the completeness question
+                    # instead of committing).
+                    self._rejected_email_candidate = None
+            if repeated_email != self._email_pending_completeness:
+                # A different spelling also resolves a pending completeness
+                # question; the unchanged case keeps it so the reporter's
+                # next affirmation remains the explicit resolution.
+                self._email_pending_completeness = None
+            confirmation_handled = True
+            handled_by_details_flow = True
         elif confirmation_active:
             awaiting_correction = self.engine.case.confirmation_response == "no"
             verdict, payload = _classify_confirmation_turn(message, pending_field)
@@ -1273,11 +1597,43 @@ class ConversationalAEWorkflow:
                 and isinstance(payload, str)
                 and payload
                 and len(payload.split()) == 1
-                and re.fullmatch(r"[A-Za-z0-9 .'\-]+", payload)
+                and re.fullmatch(
+                    # A single garbled/unknown token answering a held name
+                    # read-back ("hmm", "ഓക്കെ"-like vagaries, "പ്രിയ") is a
+                    # mumble, never a corrected name: clarify instead of
+                    # replacing the candidate. Script-aware like
+                    # _looks_like_value: Latin, Devanagari, Bengali, Gurmukhi,
+                    # Gujarati, Tamil, Telugu, Kannada, Malayalam letters.
+                    r"[A-Za-z0-9 .'\-"
+                    r"\u0900-\u097F\u0980-\u09FF\u0A00-\u0A7F\u0A80-\u0AFF"
+                    r"\u0B80-\u0BFF\u0C00-\u0C7F\u0C80-\u0CFF\u0D00-\u0D7F"
+                    r"]+",
+                    payload,
+                )
             ):
                 # A single Latin token ("hmm") is a mumble, never a first and
                 # last name: clarify instead of replacing the name candidate.
                 verdict = "ambiguous"
+            email_reconfirm_blocked = False
+            if pending_field in ("contact_phone", "reporter_contact_phone") and (
+                verdict == "yes"
+            ):
+                # An explicit confirmation of a read-back is not successful
+                # number validation: an implausible digit-run length (e.g.
+                # 11 digits without a leading zero — a doubled digit or an
+                # extra spoken word) is never committed. The candidate is
+                # discarded and the number is requested again, digit by
+                # digit, within the bounded loop.
+                candidate_now = self.engine.case.confirmation_candidate.get(
+                    pending_field
+                )
+                if candidate_now and not _is_plausible_phone(candidate_now):
+                    self.engine.respond_to_confirmation("no")
+                    clarification = _clarification_for(pending_field, False)
+                    confirmation_handled = True
+                    confirmation_rejected = False
+                    applied_any = True
+                    email_reconfirm_blocked = True
             if pending_field == "contact_email":
                 # Any reply carrying a usable address (written or spelled)
                 # is a correction/capture of the candidate - never a yes/no
@@ -1293,7 +1649,69 @@ class ConversationalAEWorkflow:
                         verdict, payload = "no", "no"
                     else:
                         verdict = "ambiguous"
-            if verdict == "ambiguous" or (
+                candidate_now = self.engine.case.confirmation_candidate.get(
+                    "contact_email"
+                )
+                if (
+                    verdict == "yes"
+                    and self._rejected_email_candidate is not None
+                    and candidate_now == self._rejected_email_candidate
+                    and self._email_pending_completeness is None
+                ):
+                    # Data-integrity guard: the reporter rejected exactly
+                    # this address, re-spelled the same value, and now gives
+                    # a bare affirmation. A rejected candidate is never
+                    # confirmed unchanged: discard it, name what it still
+                    # reads as, and ask for a fresh spelling (bounded like
+                    # every confirmation loop). Suspended once a completeness
+                    # question has been raised: the reporter has been
+                    # explicitly warned and their next spelling is informed.
+                    self.engine.respond_to_confirmation("no")
+                    clarification = _unchanged_email_clarification(
+                        self._rejected_email_candidate
+                    )
+                    confirmation_handled = True
+                    # Not a successful interpretation: the loop must count
+                    # this turn, so a stuck same-spelling loop stays bounded.
+                    confirmation_rejected = False
+                    applied_any = True
+                    email_reconfirm_blocked = True
+                elif (
+                    verdict == "yes"
+                    and self._email_pending_completeness is not None
+                    and candidate_now == self._email_pending_completeness
+                ):
+                    # Explicit completeness resolution: the reporter confirms
+                    # the exact candidate that was just read back, after the
+                    # completeness question. Fall through to the normal
+                    # commit path.
+                    self._email_pending_completeness = None
+                elif (
+                    verdict == "yes"
+                    and not awaiting_correction
+                    and self._rejected_email_candidate is not None
+                    and candidate_now is not None
+                    and candidate_now != self._rejected_email_candidate
+                    and _is_truncated_email_candidate(
+                        candidate_now, self._rejected_email_candidate
+                    )
+                ):
+                    # Truncation evidence: the re-spelling is a strict
+                    # prefix of the address the reporter just rejected
+                    # (same domain). A bare affirmation must not commit
+                    # here: raise the explicit completeness question and
+                    # keep the read-back pending (bounded like every
+                    # confirmation loop). Nothing is guessed and nothing
+                    # is discarded.
+                    self._email_pending_completeness = candidate_now
+                    clarification = _incomplete_email_clarification(candidate_now)
+                    confirmation_handled = True
+                    confirmation_rejected = False
+                    applied_any = True
+                    email_reconfirm_blocked = True
+            if email_reconfirm_blocked:
+                pass  # the turn's outcome is fully decided above
+            elif verdict == "ambiguous" or (
                 verdict == "yes" and awaiting_correction
             ):
                 clarification = _clarification_for(pending_field, awaiting_correction)
@@ -1309,17 +1727,53 @@ class ConversationalAEWorkflow:
                 confirmation_rejected = True  # clear interpretation, not a miss
                 applied_any = True
             else:
+                if pending_field == "contact_email" and verdict == "no":
+                    # Remember the rejected address: a later unchanged
+                    # candidate can never be confirmed by a bare
+                    # affirmation (see the data-integrity guard above).
+                    self._rejected_email_candidate = (
+                        self.engine.case.confirmation_candidate.get("contact_email")
+                    )
                 try:
                     self.engine.respond_to_confirmation(payload)
                     confirmation_handled = True
                     confirmation_rejected = verdict == "no"
                     applied_any = True
+                    if self.engine.case.pending_confirmation is None:
+                        # A commit fully resolves any pending completeness
+                        # question for this field.
+                        self._email_pending_completeness = None
                 except AECaseError:
                     clarification = _clarification_for(
                         pending_field, awaiting_correction
                     )
 
-        # 4a-2. Bound the read-back loop. A turn that starts with a pending
+        # 4a-2. Recoverable review: a parked read-back field resumes only
+        # when a later turn re-engages it - a restated/corrected value (a
+        # fresh candidate), a clear confirmation/rejection, or a commit.
+        # Urgent and safety parks never take this path (they never set
+        # _review_parked_field), and the park turn itself is excluded so a
+        # bounded loop cannot be undone in the same turn. Resuming restarts
+        # the field's attempt bound, so the fresh read-back gets its own
+        # bounded clarification loop and cannot instantly re-park.
+        if (
+            self._review_parked_field is not None
+            and not confirmation_review
+            and self.engine.current_state is WorkflowState.HUMAN_REVIEW
+        ):
+            parked = self._review_parked_field
+            if self.engine.case.pending_confirmation == parked and confirmation_handled:
+                self.engine.resume_from_review()
+                self._confirmation_attempts.pop(parked, None)
+                self._review_parked_field = None
+            elif self.engine.case.pending_confirmation is None and getattr(
+                self.engine.case, parked, None
+            ):
+                self.engine.resume_from_review()
+                self._confirmation_attempts.pop(parked, None)
+                self._review_parked_field = None
+
+        # 4a-3. Bound the read-back loop. A turn that starts with a pending
         # confirmation and yields an ambiguous or unrecognized reply counts as
         # one failed attempt for that field. A clear rejection is a successful
         # interpretation (the candidate is correctly discarded and the field
@@ -1356,6 +1810,12 @@ class ConversationalAEWorkflow:
                                 "qualified human review."
                             )
                         )
+                        # Remember which field was parked: the reviewer
+                        # message names it, and a later turn that re-engages
+                        # the field (a restated/corrected value or a clear
+                        # confirmation) resumes the interview (recoverable
+                        # review) while an unrelated mumble stays parked.
+                        self._review_parked_field = pending_field
                         confirmation_review = True
                         clarification = None
 
@@ -1378,6 +1838,17 @@ class ConversationalAEWorkflow:
                     # the consent question is the one on the table. Saying
                     # "no" to an email or correcting an email can never
                     # withdraw or overwrite the consent already given.
+                    continue
+                if (
+                    field_name == "onset_date"
+                    and not is_recognizable_onset(str(field_value))
+                ):
+                    # An acknowledgement or non-date answer ("अच्छा") is
+                    # never stored as the onset date: nothing recognizable
+                    # (a date, a relative expression, a period word) was
+                    # supplied, so the question is re-asked within the
+                    # bounded clarification loop and the onset stays
+                    # unknown until a valid expression is given.
                     continue
                 if (
                     field_name == "product"
@@ -1502,6 +1973,23 @@ class ConversationalAEWorkflow:
                 except Exception:
                     # Skip invalid fields per engine validation rules
                     pass
+
+        # 4b-1. Recoverable review for field-ask parks (reporter role, event
+        # description, suspected product): a parked field that a later turn
+        # successfully answered resumes the interview from it - previously
+        # collected information is never discarded. The park turn itself
+        # never reaches this branch (its unclear answer applied nothing).
+        if (
+            self._review_parked_field is not None
+            and not confirmation_review
+            and self.engine.current_state is WorkflowState.HUMAN_REVIEW
+            and self.engine.case.pending_confirmation is None
+        ):
+            parked = self._review_parked_field
+            if applied_any and getattr(self.engine.case, parked, None):
+                self.engine.resume_from_review()
+                self._field_attempts.pop(parked, None)
+                self._review_parked_field = None
 
         # 4-REASK (Step 4 clarification). A clarification turn that yields no
         # new medication counts as one failed verification attempt, bounded
@@ -1725,9 +2213,15 @@ class ConversationalAEWorkflow:
                 and not applied_any
                 and not clarification
             ):
-                self._field_attempts[field_key] = (
-                    self._field_attempts.get(field_key, 0) + 1
-                )
+                if _REPEAT_REQUEST.match(message or ""):
+                    # A repeat request is answered by re-asking the same
+                    # question, which the response below already does; it
+                    # never consumes the field's clarification bound.
+                    pass
+                else:
+                    self._field_attempts[field_key] = (
+                        self._field_attempts.get(field_key, 0) + 1
+                    )
             else:
                 self._field_attempts[field_key] = 0
             if self._field_attempts.get(field_key, 0) >= 1 and not clarification:
@@ -1757,11 +2251,15 @@ class ConversationalAEWorkflow:
                     field_key in _REVIEW_ONLY_FIELDS
                     and self._field_attempts[field_key] >= 2
                 ):
-                    # A still-unclear event description or suspected product
-                    # is bounded the same way, but the field is left empty:
-                    # no clinical description or medicine name is ever
-                    # invented. The out-of-scope stop path is unaffected (it
-                    # only triggers when a value was actually captured).
+                    # A still-unclear event description, suspected product or
+                    # reporter role is bounded the same way, but the field is
+                    # left empty: no clinical description, medicine name or
+                    # identity is ever invented. The park is RECOVERABLE
+                    # (never a silent completion): when a later turn
+                    # successfully answers the parked field, the interview
+                    # resumes from it with everything collected preserved.
+                    # The out-of-scope stop path is unaffected (it only
+                    # triggers when a value was actually captured).
                     self.engine.flag_for_review(
                         reason=(
                             f"The {field_key.replace('_', ' ')} was still "
@@ -1769,9 +2267,26 @@ class ConversationalAEWorkflow:
                             "paused for qualified human review."
                         )
                     )
+                    self._review_parked_field = field_key
                     next_field = None
                 else:
-                    next_field = (field_key, _short_clarification(field_key))
+                    if (
+                        field_key == "patient_age"
+                        and _ends_with_failed_date_attempt(message or "")
+                    ):
+                        # A recognizable but unparseable date attempt (a day
+                        # word and a year lead with the month
+                        # misrecognised): name what failed so the reporter
+                        # can fix it - the month is never guessed.
+                        next_field = (
+                            field_key,
+                            INCOMPLETE_DATE_MONTH_CLARIFICATION,
+                        )
+                    else:
+                        next_field = (
+                            field_key,
+                            _short_clarification(field_key),
+                        )
             self._last_asked_field = field_key
         else:
             self._last_asked_field = None
@@ -1799,8 +2314,19 @@ class ConversationalAEWorkflow:
         opening_emitted = bool(response_parts)
         if confirmation_review:
             # Read-back attempts are exhausted: say so plainly. The case is
-            # under human review (never completed) with everything preserved.
+            # under human review (never completed) with everything preserved,
+            # the unresolved field is named, and recovery stays open (the
+            # reporter can still say the value again to resume).
+            parked_label = _CONFIRM_FIELD_LABELS.get(
+                self._review_parked_field,
+                (self._review_parked_field or "detail").replace("_", " "),
+            )
             response_parts.append(CONFIRMATION_REVIEW_NOTICE)
+            response_parts.append(f"We could not confirm the {parked_label}.")
+            response_parts.append(
+                "You can say it again now, or our team will collect it "
+                "during review."
+            )
         else:
             if clarification:
                 # Ambiguous confirmation reply: clarify, then re-ask (the
@@ -1957,12 +2483,31 @@ class ConversationalAEWorkflow:
             # Verbatim first message kept when it could not be classified yet
             # (never promoted into adverse_event automatically).
             "unclassified_initial_input": case.unclassified_initial_input,
+            # A name captured for the combined name/date-of-birth question is
+            # held in confirmation_candidate until the read-back is confirmed
+            # (never committed without an explicit "yes"). The flat key
+            # carries committed values only, so an unconfirmed candidate is
+            # never presented as collected; when the case is parked for human
+            # review, the held candidates surface under their own "*_held"
+            # keys so the reviewer still sees what was captured without it
+            # being claimed as confirmed. During a normal pending read-back
+            # they stay hidden.
             "patient_identifier": case.patient_identifier,
+            "patient_identifier_held": (case.confirmation_candidate or {}).get(
+                "patient_identifier"
+            )
+            if case.status is WorkflowState.HUMAN_REVIEW
+            else None,
             "patient_age": case.patient_age,
             "reporter_role": case.reporter_role,
             "reporter_name": case.reporter_name,
             "reporter_contact_phone": case.reporter_contact_phone,
             "contact_phone": case.contact_phone,
+            "contact_phone_held": (case.confirmation_candidate or {}).get(
+                "contact_phone"
+            )
+            if case.status is WorkflowState.HUMAN_REVIEW
+            else None,
             "contact_email": case.contact_email,
             "contact_email_declined": case.contact_email_declined,
             "preferred_contact_method": case.preferred_contact_method,
@@ -1982,4 +2527,12 @@ class ConversationalAEWorkflow:
             "additional_information_declined": case.additional_information_declined,
             "additional_information_status": self.engine.additional_information_status,
             "priority": case.priority,
+            # Reviewer-facing note (Option B): a short description that
+            # matches no recognized symptom/report cue in any supported
+            # language may be unclear speech. It is still preserved verbatim
+            # and shown unchanged; nothing is ever rewritten, translated into
+            # a clinical interpretation, or invented.
+            "event_description_unclear": _event_description_may_be_unclear(
+                case.adverse_event
+            ),
         }

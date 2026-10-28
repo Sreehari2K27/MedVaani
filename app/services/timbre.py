@@ -18,7 +18,9 @@ https://docs.gnani.ai/api/TTS/available-voices
 
 from __future__ import annotations
 
+import math
 import random
+import struct
 import time
 from pathlib import Path
 from typing import Any
@@ -232,6 +234,82 @@ def _validate_speed(speed: object) -> None:
         )
 
 
+# ---- peak-safe loudness normalization ---------------------------------------
+#
+# The provider's speech audio measures hot peaks (76-95% of full scale) with
+# a quiet body (RMS 12-17%), so it sounds barely audible even at maximum
+# playback volume while any linear gain above ~1.3x would clip the peaks.
+# The fix raises the RMS toward a conservative target with a soft limiter
+# that hard-caps the peaks below full scale - no clipping, no distortion,
+# no amplification of already-loud audio. Pure-Python and deterministic; the
+# WAV structure (header, chunk layout, sample format) is preserved verbatim.
+_NORMALIZE_TARGET_RMS = 0.20  # of full scale
+_NORMALIZE_PEAK_CAP = 0.95  # of full scale
+_NORMALIZE_LIMITER_KNEE = 0.70  # of the peak cap
+_MIN_APPLIED_GAIN = 1.02  # below this the change is inaudible: passthrough
+_MAX_APPLIED_GAIN = 4.0  # sanity bound for near-silent payloads
+
+
+def _soft_limit(value: float, knee: float, peak: float) -> float:
+    """Smoothly compress values between the knee and the peak cap."""
+    excess = abs(value) - knee
+    return math.copysign(knee + (peak - knee) * math.tanh(excess / (peak - knee)), value)
+
+
+def _normalize_wav_loudness(audio: bytes) -> bytes:
+    """Raise quiet 16-bit PCM WAV speech to the loudness target without
+    clipping. Non-WAV, non-PCM, malformed or already-loud payloads pass
+    through byte-for-byte; the WAV structure is never rebuilt, only the
+    sample bytes inside the data chunk change. The gain targets the RMS and
+    the soft limiter (not the peak cap) bounds the hot speech peaks."""
+    if len(audio) < 44 or audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+        return audio
+    fmt = None
+    data = None
+    offset = 12
+    while offset + 8 <= len(audio):
+        chunk_id = audio[offset : offset + 4]
+        chunk_size = struct.unpack("<I", audio[offset + 4 : offset + 8])[0]
+        body_start = offset + 8
+        body_end = min(body_start + chunk_size, len(audio))
+        if chunk_id == b"fmt " and body_end - body_start >= 16:
+            fmt = struct.unpack("<HHIIHH", audio[body_start : body_start + 16])
+        elif chunk_id == b"data":
+            data = (body_start, body_end)
+        offset = body_start + chunk_size + (chunk_size & 1)
+    if fmt is None or data is None:
+        return audio
+    audio_format, channels, _rate, _byterate, _block_align, bits = fmt
+    if audio_format != 1 or bits != 16 or channels not in (1, 2):
+        return audio
+    start, end = data
+    sample_bytes = audio[start:end]
+    if not sample_bytes:
+        return audio
+    count = len(sample_bytes) // 2
+    samples = list(struct.unpack(f"<{count}h", sample_bytes[: count * 2]))
+    peak = max(abs(s) for s in samples)
+    if peak == 0:
+        return audio
+    rms = math.sqrt(sum(s * s for s in samples) / count)
+    cap_abs = _NORMALIZE_PEAK_CAP * 32767.0
+    rms_frac = rms / 32767.0
+    if rms_frac >= _NORMALIZE_TARGET_RMS:
+        return audio  # already at or above the target loudness
+    gain = min(_NORMALIZE_TARGET_RMS / rms_frac, _MAX_APPLIED_GAIN)
+    if gain <= _MIN_APPLIED_GAIN:
+        return audio  # the change would be inaudible: leave it untouched
+    knee = _NORMALIZE_LIMITER_KNEE * cap_abs
+    limited = []
+    for sample in samples:
+        amplified = sample * gain
+        if abs(amplified) > knee:
+            amplified = _soft_limit(amplified, knee, cap_abs)
+        limited.append(int(amplified))
+    normalized = struct.pack(f"<{count}h", *limited)
+    return audio[:start] + normalized + audio[end:]
+
+
 class TimbreTTS:
     """Synthesizes speech with Gnani Timbre v2.5 over the REST endpoint."""
 
@@ -364,7 +442,7 @@ class TimbreTTS:
         **kwargs: Any,
     ) -> Path:
         """Convert text to speech, write the audio to disk and return the path."""
-        audio = self.synthesize(text, **kwargs)
+        audio = _normalize_wav_loudness(self.synthesize(text, **kwargs))
 
         path = Path(output_path)
         if path.is_dir():

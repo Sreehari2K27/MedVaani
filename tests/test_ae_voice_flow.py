@@ -385,7 +385,7 @@ def test_patient_branch_follows_the_documented_sequence():
     assert records[5]["next_text"] == (
         "Could you please share the best contact number for you?"
     )
-    assert records[6]["next_text"] == "I have the number ending in 4321. Is that correct?"
+    assert records[6]["next_text"] == "I have a 10-digit number ending in 4321. Is that correct?"
     # Step 10B.2 is asked in the response (the closing question has never
     # been part of next_question), directly after the incident date.
     assert records[13]["next_key"] is None
@@ -422,13 +422,13 @@ def test_confirmations_are_not_repeated_after_explicit_confirmation():
 
     assert reporter_text.count("I have your name as") == 1
     assert reporter_text.count("Let me read that back") == 1
-    assert reporter_text.count("I have the number ending in") == 2  # 6A.4 + 6A.8
+    assert reporter_text.count("number ending in") == 2  # 6A.4 + 6A.8
 
     _, self_records = _drive("AE-flow-confirm-once-self", SELF_JOURNEY)
     self_text = "\n".join(record["response"] for record in self_records)
 
     assert self_text.count("I have your details as") == 1
-    assert self_text.count("I have the number ending in") == 1
+    assert self_text.count("number ending in") == 1
     assert self_text.count("I heard your email address") == 1
     # The patient contact number is never asked again after it is confirmed.
     assert self_text.count("best contact number for you") == 1

@@ -9,9 +9,13 @@
  */
 
 import {
+  assistantDisplayText,
+  audioUrlFor,
+  postGreeting,
   postTextTurn,
   postVoiceTurn,
   resolveRequestLanguage,
+  type VoiceTurnResponse,
 } from "./voiceClient.ts";
 
 let failures = 0;
@@ -79,6 +83,94 @@ check(
 check(
   captured[2]?.language === "en-IN",
   "voice request without an explicit language still defaults to en-IN",
+);
+
+// ---- Greeting endpoint ------------------------------------------------------
+
+interface GreetingCapture {
+  url: string;
+  sessionId: string | null;
+  language: string | null;
+}
+
+const greetingCaptured: GreetingCapture[] = [];
+globalThis.fetch = (async (url: RequestInfo | URL, init?: RequestInit) => {
+  const body = init?.body;
+  greetingCaptured.push({
+    url: String(url),
+    sessionId:
+      body instanceof FormData ? (body.get("session_id") as string | null) : null,
+    language:
+      body instanceof FormData ? (body.get("language") as string | null) : null,
+  });
+  return new Response(
+    JSON.stringify({
+      session_id: "sess-greet",
+      response_text: "Thank you for taking the time to speak with us.",
+      audio_path: "output\\conv_intro_sess-greet.wav",
+    }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+}) as typeof fetch;
+
+try {
+  await postGreeting("sess-greet", "ta-IN");
+  await postGreeting("sess-greet-default");
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+check(
+  greetingCaptured[0]?.url === "/voice/introduction",
+  "postGreeting targets the introduction endpoint",
+);
+check(
+  greetingCaptured[0]?.sessionId === "sess-greet",
+  "postGreeting carries the session id",
+);
+check(
+  greetingCaptured[0]?.language === "ta-IN",
+  "postGreeting carries the explicitly selected locale for the spoken introduction",
+);
+check(
+  greetingCaptured[1]?.language === "en-IN",
+  "postGreeting without an explicit locale still defaults to en-IN",
+);
+const greetingUrl = audioUrlFor("output\\conv_intro_sess-greet.wav");
+check(
+  greetingUrl.startsWith("/audio/conv_intro_sess-greet.wav?_="),
+  "greeting audio_path maps to the served /audio/ route (the raw output\\ path 404s)",
+);
+
+// ---- Visible text matches the spoken form ----------------------------------
+
+const asTurn = (partial: Partial<VoiceTurnResponse>): VoiceTurnResponse =>
+  ({ response_text: "", ...partial }) as VoiceTurnResponse;
+
+check(
+  assistantDisplayText(
+    asTurn({
+      response_text: "English text",
+      spoken_response_text: "हिंदी टेक्स्ट",
+      language_translated: true,
+    }),
+  ) === "हिंदी टेक्स्ट",
+  "a translated response displays exactly the text that was spoken",
+);
+check(
+  assistantDisplayText(
+    asTurn({
+      response_text: "English text",
+      spoken_response_text: "हिंदी टेक्स्ट",
+      language_translated: false,
+    }),
+  ) === "English text",
+  "an untranslated response keeps the English text that was spoken",
+);
+check(
+  assistantDisplayText(asTurn({ response_text: "English text" })) ===
+    "English text",
+  "missing language metadata falls back to the English response text",
 );
 
 // ---- Result -----------------------------------------------------------------

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import lantusPen from "../../assets/lantus-solostar.png.png";
 import {
   AE_STAGES,
-  OPENING_MESSAGE,
+  initialLiveMessages,
   stageStatusText,
   type AeChatMessage,
 } from "../../ae/aeDemoConversation";
@@ -13,13 +13,24 @@ import {
   type AeCollectedInfo,
 } from "../../ae/aeLiveConversation";
 import {
+  createVoiceStartup,
+  micClickAction,
+  type VoiceStartup,
+  type VoiceStartupState,
+} from "../../ae/aeVoiceStartup";
+import {
+  assistantDisplayText,
   audioUrlFor,
+  postGreeting,
   postTextTurn,
   postVoiceTurn,
   resolveRequestLanguage,
+  SUPPORTED_LANGUAGES,
   type VoiceTurnResponse,
 } from "../../api/voiceClient";
 import { useWavRecorder } from "../../hooks/useWavRecorder";
+import { composerControls } from "../../ae/aeComposerControls";
+import { languageSelectDisabled } from "../../ae/aeVoiceStartup";
 
 function CheckIcon({ size = 14 }: { size?: number }) {
   return (
@@ -197,21 +208,36 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
   // POST /text/conversation and recorded turns through /voice/conversation,
   // sharing one session so the approved question order, confirmations and
   // branches are identical. The mic stays disabled in typed mode.
+  // The composer itself is mode-specific (composerControls): typed mode owns
+  // the text field and the send button; voice-only mode hides the text input
+  // entirely and offers only the microphone.
   const [draft, setDraft] = useState("");
   const [micNotice, setMicNotice] = useState(false);
 
   const [sessionId] = useState(newSessionId);
-  const [liveMessages, setLiveMessages] = useState<AeChatMessage[]>([
-    { id: "ae-live-open", role: "assistant", text: OPENING_MESSAGE },
-  ]);
+  const [liveMessages, setLiveMessages] =
+    useState<AeChatMessage[]>(initialLiveMessages);
   const [liveStarted, setLiveStarted] = useState(false);
   const [liveBackend, setLiveBackend] = useState<LiveBackendState | null>(null);
   const [liveFinished, setLiveFinished] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [voiceStart, setVoiceStart] = useState<VoiceStartupState | null>(null);
+  // Explicit language hint: defaults to the browser-language mapping and is
+  // locked once the backend has established the conversation language (the
+  // selector disables; the session itself is never reset).
+  const [requestLanguage, setRequestLanguage] = useState(currentRequestLanguage);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const liveIdRef = useRef(1);
+  const startupRef = useRef<VoiceStartup | null>(null);
+  const startupBegunRef = useRef(false);
+  const greetingAudioRef = useRef<{ pause(): void } | null>(null);
+  // Latest selection for the greeting request: read through a ref so the
+  // one-shot startup effect never re-runs (its cleanup would pause a playing
+  // introduction) while still picking up a change made during "loading".
+  const requestLanguageRef = useRef(requestLanguage);
+  requestLanguageRef.current = requestLanguage;
 
   const pushLive = useCallback((message: Omit<AeChatMessage, "id">) => {
     liveIdRef.current += 1;
@@ -237,6 +263,15 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
     const element = new Audio(url);
     audioRef.current = element;
     element.play().catch(() => undefined);
+  }, []);
+
+  // A manual mic tap or typed message supersedes the greeting: pause it and
+  // cancel the startup so an in-flight greeting request can never start
+  // speaking over the user's turn (nor auto-start a second recording).
+  const takeOverGreeting = useCallback(() => {
+    greetingAudioRef.current?.pause();
+    startupRef.current?.cancel();
+    setVoiceStart(null);
   }, []);
 
   // Shared envelope handling for both voice and text turns: the backend
@@ -270,18 +305,22 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
         });
       }
 
+      // Visible text always matches the spoken form: the backend returns
+      // English `response_text` plus the translated `spoken_response_text`
+      // actually synthesized (all-or-nothing), so the screen and the audio
+      // can never disagree after a language switch.
       if (result.safety_status === "urgent_life_threatening") {
         pushLive({
           role: "safety",
           lines: [
-            result.response_text,
+            assistantDisplayText(result),
             "Your report information can be preserved for human review.",
           ],
         });
       } else if (result.safety_status === "treatment_request_blocked") {
-        pushLive({ role: "notice", text: result.response_text });
+        pushLive({ role: "notice", text: assistantDisplayText(result) });
       } else {
-        pushLive({ role: "assistant", text: result.response_text });
+        pushLive({ role: "assistant", text: assistantDisplayText(result) });
       }
 
       if (result.audio_path) {
@@ -295,7 +334,7 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
     async (blob: Blob) => {
       setBusy(true);
       try {
-        const result = await postVoiceTurn(sessionId, blob, currentRequestLanguage());
+        const result = await postVoiceTurn(sessionId, blob, requestLanguage);
         applyTurnResult(result);
       } catch (error) {
         const text =
@@ -307,15 +346,16 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
         setBusy(false);
       }
     },
-    [applyTurnResult, pushErrorNotice, sessionId],
+    [applyTurnResult, pushErrorNotice, requestLanguage, sessionId],
   );
 
   // Typed live turn through POST /text/conversation (same backend workflow).
   const sendTextTurn = useCallback(
     async (text: string) => {
+      takeOverGreeting();
       setBusy(true);
       try {
-        const result = await postTextTurn(sessionId, text, currentRequestLanguage());
+        const result = await postTextTurn(sessionId, text, requestLanguage);
         applyTurnResult(result);
         setDraft("");
       } catch (error) {
@@ -328,7 +368,7 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
         setBusy(false);
       }
     },
-    [applyTurnResult, pushErrorNotice, sessionId],
+    [applyTurnResult, pushErrorNotice, requestLanguage, sessionId, takeOverGreeting],
   );
 
   const recorder = useWavRecorder({
@@ -336,6 +376,62 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
       void sendRecording(blob);
     },
   });
+
+  // Voice-first startup (live sessions only): fetch the approved greeting
+  // and play it once. `startupBegunRef` guards React StrictMode's double
+  // effect so the greeting is fetched and played exactly once per mount;
+  // the seeded chat message above is the only display of the introduction
+  // (the startup module never pushes messages), so rerenders and retries
+  // cannot duplicate it. Playback NEVER starts the microphone: after the
+  // introduction finishes the state settles on "ready" and recording waits
+  // for an explicit mic-button click (handleMicClick below).
+  useEffect(() => {
+    if (mode !== "live" || startupBegunRef.current) {
+      return;
+    }
+    startupBegunRef.current = true;
+    const startup = createVoiceStartup({
+      fetchGreeting: async () => {
+        const greeting = await postGreeting(sessionId, requestLanguageRef.current);
+        // Visible text must match what is spoken: when the backend localized
+        // the introduction, swap the seeded English greeting for the spoken
+        // form (all-or-nothing translation; English fallback stays English).
+        if (greeting.language_translated && greeting.spoken_response_text) {
+          const spoken = greeting.spoken_response_text;
+          setLiveMessages((prev) =>
+            prev.map((message) =>
+              message.id === "ae-live-open" ? { ...message, text: spoken } : message,
+            ),
+          );
+        }
+        return greeting;
+      },
+      createAudio: (url) => {
+        // `audio_path` is a filesystem path (output\conv_intro_*.wav); it
+        // must go through audioUrlFor() to become a served /audio/ URL,
+        // exactly like turn audio — a raw path would 404 and stay silent.
+        const element = new Audio(audioUrlFor(url));
+        greetingAudioRef.current = element;
+        return {
+          play: () => element.play(),
+          pause: () => element.pause(),
+          onEnded: (listener) =>
+            element.addEventListener("ended", listener, { once: true }),
+          onError: (listener) =>
+            element.addEventListener("error", () => listener("load-error"), {
+              once: true,
+            }),
+        };
+      },
+      onState: (next) => setVoiceStart(next),
+    });
+    startupRef.current = startup;
+    void startup.begin();
+    return () => {
+      greetingAudioRef.current?.pause();
+      greetingAudioRef.current = null;
+    };
+  }, [mode, sessionId]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -355,19 +451,29 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
   };
 
   const handleMicClick = () => {
-    if (mode === "demo") {
+    // The mic button is the ONLY action that starts recording (the startup
+    // module has no microphone port); the shared decision helper keeps the
+    // precedence testable: demo notice, busy ignore, stop/sent, else start.
+    const action = micClickAction({
+      demoMode: mode === "demo",
+      busy,
+      recording: recorder.recording,
+    });
+    if (action === "demo-notice") {
       setMicNotice(true);
       return;
     }
-    if (busy) return;
-    if (recorder.recording) {
+    if (action === "ignore") return;
+    if (action === "stop") {
       recorder.stop();
       return;
     }
+    takeOverGreeting();
     void recorder.start();
   };
 
   const demoMode = mode === "demo";
+  const composer = composerControls({ mode });
   const liveStates = liveStageStates(
     liveBackend?.collected,
     liveBackend?.completed ?? false,
@@ -399,6 +505,8 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
     )
   ) : recorder.error ? (
     <span className="ae-composer-hint--notice">{recorder.error}</span>
+  ) : voiceStart === "playing" ? (
+    <span>The introduction is playing — tap the mic when you&apos;re ready</span>
   ) : recorder.recording ? (
     <span className="ae-composer-hint--recording">
       Recording… tap the mic again to send (auto-stops at 60s)
@@ -406,8 +514,79 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
   ) : busy ? (
     <span>Please wait…</span>
   ) : (
-    <span>Type your message, or tap the mic to record (max 60s)</span>
+    <span>Tap the mic to record (max 60 seconds)</span>
   );
+
+  // Visible states for the greeting: loading, autoplay blocked (manual
+  // play fallback), and greeting-audio failure. Every fallback button here
+  // only plays/retries the introduction — none of them start the
+  // microphone; recording begins exclusively at the mic button below.
+  const resumeStartup = () => {
+    void startupRef.current?.resume();
+  };
+
+  const renderVoiceStart = () => {
+    if (demoMode || !voiceStart) return null;
+    if (voiceStart === "loading") {
+      return (
+        <div className="ae-voice-start ae-voice-start--loading" role="status">
+          Preparing the introduction…
+        </div>
+      );
+    }
+    if (voiceStart === "blocked") {
+      return (
+        <div className="ae-voice-start" role="alert">
+          <span className="ae-voice-start-text">
+            Your browser blocked automatic playback. Hear the introduction
+            when you&apos;re ready — the mic stays off until you tap it.
+          </span>
+          <button
+            type="button"
+            className="ae-voice-start-btn"
+            onClick={resumeStartup}
+          >
+            Hear the introduction
+          </button>
+        </div>
+      );
+    }
+    if (voiceStart === "audio-error") {
+      return (
+        <div className="ae-voice-start" role="alert">
+          <span className="ae-voice-start-text">
+            The introduction audio couldn&apos;t be played. You can retry, or
+            use the mic button when you&apos;re ready.
+          </span>
+          <button
+            type="button"
+            className="ae-voice-start-btn"
+            onClick={resumeStartup}
+          >
+            Try again
+          </button>
+        </div>
+      );
+    }
+    if (voiceStart === "unavailable") {
+      return (
+        <div className="ae-voice-start" role="alert">
+          <span className="ae-voice-start-text">
+            The spoken introduction isn&apos;t available right now — it&apos;s
+            shown above.
+          </span>
+          <button
+            type="button"
+            className="ae-voice-start-btn"
+            onClick={resumeStartup}
+          >
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return null;
+  };
 
   return (
     <div className="container ae-convo">
@@ -437,52 +616,47 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
         </div>
 
         <div className="ae-composer-zone">
+          {renderVoiceStart()}
           <div className="ae-composer-card">
-            <input
-              type="text"
-              value={draft}
-              placeholder={
-                demoMode
-                  ? "Describe what happened…"
-                  : "Type your message…"
-              }
-              aria-label="Describe what happened"
-              autoComplete="off"
-              disabled={busy}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") handleSend();
-              }}
-            />
-            {!demoMode ? (
+            {composer.textInput ? (
+              <input
+                type="text"
+                value={draft}
+                placeholder="Describe what happened…"
+                aria-label="Describe what happened"
+                autoComplete="off"
+                disabled={busy}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") handleSend();
+                }}
+              />
+            ) : null}
+            {composer.micButton ? (
               <button
                 type="button"
                 className={
-                  !demoMode && recorder.recording
+                  recorder.recording
                     ? "ae-mic-btn ae-mic-btn--recording"
                     : "ae-mic-btn"
                 }
                 aria-label={
-                  demoMode
-                    ? "Voice input"
-                    : recorder.recording
-                      ? "Stop recording and send"
-                      : "Start recording"
+                  recorder.recording
+                    ? "Stop recording and send"
+                    : "Start recording"
                 }
                 title={
-                  demoMode
-                    ? "Voice capture is not enabled in this prototype yet"
-                    : recorder.recording
-                      ? "Tap to send your recording"
-                      : "Tap to record (max 60 seconds)"
+                  recorder.recording
+                    ? "Tap to send your recording"
+                    : "Tap to record (max 60 seconds)"
                 }
-                disabled={!demoMode && busy}
+                disabled={busy}
                 onClick={handleMicClick}
               >
                 <MicIcon />
               </button>
             ) : null}
-            {demoMode ? (
+            {composer.sendButton ? (
               <button
                 type="button"
                 className="ae-send-btn"
@@ -493,6 +667,24 @@ function AeChat({ initialMode = "demo" }: AeChatProps) {
                 <SendIcon />
               </button>
             ) : null}
+          </div>
+          <div className="ae-lang-picker">
+            <label className="ae-lang-picker-label" htmlFor="ae-language-select">
+              Report language
+            </label>
+            <select
+              id="ae-language-select"
+              className="ae-lang-picker-select"
+              value={requestLanguage}
+              disabled={languageSelectDisabled({ liveStarted, busy })}
+              onChange={(event) => setRequestLanguage(event.target.value)}
+            >
+              {SUPPORTED_LANGUAGES.map((option) => (
+                <option key={option.code} value={option.code}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </div>
           <p className="ae-composer-lang-note">
             For your comfort, you may describe your experience in the language

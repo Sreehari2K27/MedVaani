@@ -157,11 +157,13 @@ def _question_for(key: str, case: "AECase") -> str:
         return "Could you please share the best contact number for you?"
     if key == "contact_email":
         # Kept in sync with EMAIL_REQUEST_QUESTION in the conversation
-        # service: dictated/spelled addresses are invited explicitly.
+        # service: dictated/spelled addresses are invited explicitly, with
+        # the letter-pause instruction so adjacent same-sound letters
+        # (e.g. a doubled E) are dictated as separate tokens.
         return (
             "Could you please spell out your email address, one letter or "
-            "number at a time? You can say 'at the rate' for @ and 'dot' for "
-            "a period."
+            "number at a time, with a short pause between letters? You can "
+            "say 'at the rate' for @ and 'dot' for a period."
         )
     if key == "onset_date":
         return "Could you tell me when the event occurred?"
@@ -198,6 +200,27 @@ ALLOWED_FIELD_VALUES: dict[str, frozenset[str]] = _ALLOWED_VALUES
 
 _IMMUTABLE_FIELDS = frozenset({"case_id", "status", "human_review_reason"})
 
+# The structured identity fields whose stored value is the properly
+# capitalized display form: the raw transcript is never modified (the
+# audit trail keeps the reporter's own words); only these structured
+# fields are formatted.
+_NAME_FIELDS = frozenset({"patient_identifier", "reporter_name"})
+
+
+def _title_case_latin_name(value: str) -> str:
+    """Capitalize the first alphabetic character of each Latin-script word
+    ("raju sharma" -> "Raju Sharma"). The remaining letters are never
+    changed (McDonald, Lantus SoloStar keep their internal capitalization)
+    and non-Latin scripts (no case mapping) are untouched. No component is
+    invented, expanded, or removed; punctuation and whitespace are kept."""
+    titled = []
+    for word in value.split(" "):
+        if word and word[0].isascii() and word[0].isalpha() and word[0].islower():
+            titled.append(word[0].upper() + word[1:])
+        else:
+            titled.append(word)
+    return " ".join(titled)
+
 # Normalised replies to a read-back question ("I heard X. Is that correct?").
 # Anything outside these sets is treated as a corrected value.
 _AFFIRMATIVE_REPLIES = frozenset(
@@ -206,6 +229,27 @@ _AFFIRMATIVE_REPLIES = frozenset(
         "correct", "right",
         "that's correct", "that is correct", "that's right", "that is right",
         "ok", "okay", "confirmed", "true",
+        # Standalone affirmative replies in the eight newly supported
+        # languages, exact full-reply matches only: a sentence is never a
+        # confirmation. The observed Malayalam forms ("അതെ",
+        # "അതെ തന്നെ") are pinned; "ശരിയാണ്" ("that's correct") is the
+        # observed browser reply that must confirm, "അതേ" is its
+        # standard spelling variant, "അത് ശരിയാണ്"/"അത് ശരി" are the
+        # pronoun-led echoes of the read-back question, and "യെസ്"/"യസ്"
+        # pronoun-led echoes of the read-back question, "യെസ്"/"യസ്"
+        # are the Malayalam-script transliterations of spoken "yes" that
+        # the browser STT emits, "हो"/"हो बरोबर आहे"/"होय ते बरोबर आहे"
+        # are the observed Marathi affirmative and its compounds, and
+        # "hoy"/"ho"/"barobar" are their Latin-script transliterations.
+        "होय", "बरोबर",
+        "হ্যাঁ", "ঠিক আছে", "ਹਾਂ", "ਠੀਕ ਹੈ", "હા", "સાચું",
+        "ಹೌದು", "ಸರಿ", "అవును", "సరే", "సరి", "ஆம்", "சரி",
+        "അതെ", "അതെ തന്നെ", "അതേ", "ശരി", "ശരിയാണ്",
+        "അത് ശരിയാണ്", "അത് ശരി",
+        "യെസ്", "യസ്",
+        "हो", "हो बरोबर आहे", "बरोबर आहे", "होय बरोबर आहे", "होय ते बरोबर आहे",
+        "hoy", "ho", "barobar",
+        "ഓക്കെ", "ആ അതെ", "ആ ശരിയാണ്",
     }
 )
 
@@ -213,6 +257,11 @@ _NEGATIVE_REPLIES = frozenset(
     {
         "no", "n", "nope", "wrong", "incorrect",
         "that's wrong", "that is wrong", "not correct", "not right",
+        # Standalone negative replies in the eight newly supported languages
+        # (exact full-reply matches only; Hindi keeps its existing path).
+        "नाही",
+        "না", "নয়", "ਨਹੀਂ", "ਨਾ", "ના", "નહીં",
+        "ಇಲ್ಲ", "కాదు", "లేదు", "இல்லை", "ഇല്ല", "അല്ല",
     }
 )
 
@@ -223,7 +272,7 @@ def _classify_confirmation_reply(reply: str) -> str:
     Deterministic and text-only: the caller/LLM layer normalises free speech
     into short answers; any unrecognised reply is taken as a corrected value.
     """
-    normalized = reply.strip().lower().rstrip(" .!?,").strip()
+    normalized = reply.strip().lower().rstrip(" .!?,").rstrip("\u0964").strip()
     if normalized in _AFFIRMATIVE_REPLIES:
         return "yes"
     if normalized in _NEGATIVE_REPLIES:
@@ -458,9 +507,12 @@ class AEStateEngine:
             phone = self.case.confirmation_candidate.get(
                 field, getattr(self.case, field, '') or ''
             )
+            # The count is derived from the exact candidate being confirmed,
+            # so a doubled or missing digit is audible at confirmation time
+            # while the number itself is never read aloud.
             digits = "".join(ch for ch in str(phone) if ch.isdigit())
             tail = digits[-4:] if len(digits) >= 4 else digits
-            return f"I have the number ending in {tail}. Is that correct?"
+            return f"I have a {len(digits)}-digit number ending in {tail}. Is that correct?"
         if field == "contact_email":
             email = self.case.confirmation_candidate.get('contact_email', self.case.contact_email or '')
             return f"I heard your email address as {email}. Is that correct?"
@@ -542,7 +594,10 @@ class AEStateEngine:
         else:
             if not isinstance(value, str) or not value.strip():
                 raise AECaseValidationError(f"'{field}' must be a non-empty string.")
-            setattr(self.case, field, value.strip())
+            stored = value.strip()
+            if field in _NAME_FIELDS:
+                stored = _title_case_latin_name(stored)
+            setattr(self.case, field, stored)
 
         if field == "reporter_role" and value == "self":
             # Reporter is the patient: do not keep a duplicate reporter name
@@ -592,7 +647,10 @@ class AEStateEngine:
         if not isinstance(candidate, str) or not candidate.strip():
             raise AECaseValidationError(f"'{field}' must be a non-empty string.")
         self.case.pending_confirmation = field
-        self.case.confirmation_candidate = {field: candidate.strip()}
+        stored_candidate = candidate.strip()
+        if field in _NAME_FIELDS:
+            stored_candidate = _title_case_latin_name(stored_candidate)
+        self.case.confirmation_candidate = {field: stored_candidate}
         self.case.confirmation_response = None
         self.case.confirmed_fields.discard(field)
         return self._confirmation_question()
@@ -716,6 +774,22 @@ class AEStateEngine:
         """
         self.case.status = WorkflowState.HUMAN_REVIEW
         self.case.human_review_reason = reason
+        return self
+
+    def resume_from_review(self) -> "AEStateEngine":
+        """Leave HUMAN_REVIEW and recompute normal progression.
+
+        Used only when a field that was parked for review is re-engaged by
+        the reporter (a corrected candidate or a successful confirmation):
+        the status returns to the normal progression given the fields
+        actually satisfied, and the interview continues. Urgent escalations
+        (``mark_urgent``) are never resumed through this path; the recorded
+        ``human_review_reason`` is kept for traceability.
+        """
+        if self.case.status is not WorkflowState.HUMAN_REVIEW:
+            return self
+        self.case.status = WorkflowState.CASE_CREATED
+        self._recompute_status()
         return self
 
     # ---- serialization ------------------------------------------------------

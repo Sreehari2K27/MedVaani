@@ -555,3 +555,117 @@ def test_cli_does_not_print_api_key(
 
     output = capsys.readouterr().out
     assert secret not in output
+
+
+# ---- peak-safe loudness normalization (synthesized_to_file payloads) --------
+
+
+def _pcm_wav(samples: list[int], channels: int = 1, rate: int = 48000) -> bytes:
+    """Build a minimal real 16-bit PCM WAV from raw sample values."""
+    import io
+    import struct
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(channels)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+    return buf.getvalue()
+
+
+def _wav_data_stats(payload: bytes) -> tuple[int, float]:
+    """Peak (int) and RMS (fraction of full scale) of the WAV data chunk."""
+    import math
+    import struct
+
+    i = payload.find(b"data")
+    size = struct.unpack("<I", payload[i + 4 : i + 8])[0]
+    count = min(size, len(payload) - (i + 8)) // 2
+    samples = struct.unpack(f"<{count}h", payload[i + 8 : i + 8 + count * 2])
+    peak = max(abs(s) for s in samples)
+    rms = math.sqrt(sum(s * s for s in samples) / count)
+    return peak, rms / 32767.0
+
+
+def _quiet_speech_wav() -> bytes:
+    # A low-amplitude sine shaped like the measured provider profile:
+    # peaks ~20%, RMS ~14% of full scale.
+    return _pcm_wav([int(6500 * __import__("math").sin(i * 0.02)) for i in range(48000)])
+
+
+def test_quiet_wav_is_normalized_to_the_target_rms():
+    payload = _quiet_speech_wav()
+    peak_before, rms_before = _wav_data_stats(payload)
+
+    normalized = timbre._normalize_wav_loudness(payload)
+
+    peak_after, rms_after = _wav_data_stats(normalized)
+    assert rms_before < rms_after
+    assert rms_after == pytest.approx(0.20, abs=0.02)
+    assert peak_after <= timbre._NORMALIZE_PEAK_CAP * 32767
+    # Structure preserved: same length, same header, no clipped samples.
+    assert len(normalized) == len(payload)
+    assert normalized[:44] == payload[:44]
+
+
+def test_hot_peaks_are_limited_without_clipping():
+    # The measured live profile: near-full-scale peaks with a quiet body.
+    # The limiter must cap the amplified peaks below full scale.
+    import math
+
+    samples = []
+    for i in range(48000):
+        body = 5500 * math.sin(i * 0.02)
+        if i % 4000 < 40:
+            body = 31000 if i % 8000 < 4000 else -31000  # hot peaks
+        samples.append(int(body))
+    payload = _pcm_wav(samples)
+
+    normalized = timbre._normalize_wav_loudness(payload)
+
+    peak_after, rms_after = _wav_data_stats(normalized)
+    assert peak_after <= timbre._NORMALIZE_PEAK_CAP * 32767
+    assert rms_after > 0.15  # the body got louder, not just the peaks
+    count = len(normalized) - 44
+    import struct
+    values = struct.unpack(f"<{count // 2}h", normalized[44 : 44 + count])
+    assert max(abs(v) for v in values) <= timbre._NORMALIZE_PEAK_CAP * 32767
+
+
+def test_already_loud_wav_passes_through_unchanged():
+    import math
+
+    payload = _pcm_wav([int(28000 * math.sin(i * 0.02)) for i in range(4800)])
+    assert timbre._normalize_wav_loudness(payload) == payload
+
+
+def test_non_wav_payload_passes_through_unchanged():
+    assert timbre._normalize_wav_loudness(FAKE_AUDIO) == FAKE_AUDIO
+
+
+def test_malformed_wav_passes_through_unchanged():
+    payload = _quiet_speech_wav()[:30]  # truncated header
+    assert timbre._normalize_wav_loudness(payload) == payload
+
+
+def test_stereo_quiet_wav_is_normalized():
+    import math
+
+    samples: list[int] = []
+    for i in range(24000):
+        samples += [int(6500 * math.sin(i * 0.02))] * 2
+    payload = _pcm_wav(samples, channels=2)
+
+    normalized = timbre._normalize_wav_loudness(payload)
+
+    peak_after, rms_after = _wav_data_stats(normalized)
+    assert rms_after == pytest.approx(0.20, abs=0.02)
+    assert peak_after <= timbre._NORMALIZE_PEAK_CAP * 32767
+    assert len(normalized) == len(payload)
+
+
+def test_silence_passes_through_unchanged():
+    payload = _pcm_wav([0] * 4800)
+    assert timbre._normalize_wav_loudness(payload) == payload
