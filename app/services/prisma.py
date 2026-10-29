@@ -18,6 +18,8 @@ https://docs.gnani.ai/api/STT/speech-to-text
 from __future__ import annotations
 
 import mimetypes
+import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,16 @@ DEFAULT_LANGUAGE_CODE = "en-IN"
 DEFAULT_OUTPUT_FORMAT = "verbatim"
 
 REQUEST_TIMEOUT_SECONDS: tuple[int, int] = (10, 60)
+
+# Transient STT failure conventions mirror the Timbre TTS adapter
+# (app/services/timbre.py): the same bounded retry/backoff constants and the
+# same provider gateway, adapted to the STT request lifecycle below.
+RETRYABLE_STATUS_CODES: tuple[int, ...] = (429, 500, 502, 503, 504)
+DEFAULT_MAX_ATTEMPTS = 3
+DEFAULT_BACKOFF_BASE_SECONDS = 0.5
+MAX_BACKOFF_SECONDS = 5.0
+JITTER_MAX_SECONDS = 0.25
+MAX_RETRY_AFTER_SECONDS = 10.0
 
 SUPPORTED_LANGUAGE_CODES: tuple[str, ...] = (
     "bn-IN",
@@ -62,6 +74,7 @@ STATUS_HINTS: dict[int, str] = {
     429: "Rate limit exceeded. Wait a moment and retry.",
     500: "Gnani server error. Retry shortly.",
     503: "Gnani speech service is temporarily unavailable. Retry shortly.",
+    504: "The speech gateway timed out. Retry shortly.",
 }
 
 
@@ -94,10 +107,17 @@ class PrismaAPIError(PrismaError):
         *,
         status_code: int | None = None,
         error_type: str | None = None,
+        retry_after: float | None = None,
+        body_head: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.error_type = error_type
+        self.retry_after = retry_after
+        # Optional truncated provider-body head for operator-side diagnostics
+        # only. Never part of the public message, so no gateway HTML or
+        # provider body text reaches users.
+        self.body_head = body_head
 
     @property
     def hint(self) -> str | None:
@@ -118,6 +138,23 @@ class TranscriptionResult:
     # does not currently expose one, so this stays ``None`` unless a future
     # provider body includes it; callers must treat it as best-effort only.
     detected_language: str | None = None
+
+
+def _parse_retry_after(headers: Any) -> float | None:
+    """Parse a numeric ``Retry-After`` header into seconds (``None`` if unusable)."""
+    try:
+        raw = (headers or {}).get("Retry-After")
+    except (AttributeError, TypeError):
+        return None
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0 or seconds != seconds:  # negative or NaN never guides a retry
+        return None
+    return seconds
 
 
 def _extract_error(payload: Any, status_code: int) -> tuple[str, str | None]:
@@ -167,11 +204,17 @@ class PrismaSTT:
         endpoint: str = DEFAULT_ENDPOINT,
         session: requests.Session | None = None,
         timeout: float | tuple[float, float] = REQUEST_TIMEOUT_SECONDS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        backoff_base_seconds: float = DEFAULT_BACKOFF_BASE_SECONDS,
     ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1.")
         self._api_key = api_key
         self._endpoint = endpoint
         self._session = session if session is not None else requests.Session()
         self._timeout = timeout
+        self._max_attempts = max_attempts
+        self._backoff_base_seconds = backoff_base_seconds
 
     @property
     def endpoint(self) -> str:
@@ -183,7 +226,15 @@ class PrismaSTT:
         language_code: str = DEFAULT_LANGUAGE_CODE,
         output_format: str = DEFAULT_OUTPUT_FORMAT,
     ) -> TranscriptionResult:
-        """Send one audio file to Gnani Prisma v2.5 and return its transcript."""
+        """Send one audio file to Gnani Prisma v2.5 and return its transcript.
+
+        Transient upstream failures (HTTP 429/500/502/503/504 and connection
+        errors) are retried with bounded backoff. Read timeouts are never
+        retried because the outcome of the first request is unknown: the
+        provider may already have processed and billed the transcription.
+        Permanently rejected requests (400/401/403) and malformed bodies with
+        a non-transient status raise immediately.
+        """
         api_key = self._api_key if self._api_key is not None else get_gnani_api_key()
         if not api_key:
             raise PrismaConfigurationError(
@@ -212,45 +263,89 @@ class PrismaSTT:
 
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
 
-        try:
-            with path.open("rb") as handle:
-                response = self._session.post(
-                    self._endpoint,
-                    headers={"X-API-Key-ID": api_key},
-                    data={"language_code": language_code, "format": output_format},
-                    files={"audio_file": (path.name, handle, content_type)},
-                    timeout=self._timeout,
-                )
-        except requests.exceptions.Timeout as exc:
-            raise PrismaNetworkError(
-                f"Gnani STT request timed out after {self._timeout}: {exc}"
-            ) from exc
-        except requests.exceptions.RequestException as exc:
-            raise PrismaNetworkError(f"Gnani STT request failed: {exc}") from exc
+        last_error: PrismaError | None = None
+        for attempt in range(self._max_attempts):
+            if attempt > 0:
+                self._sleep_before_retry(attempt, last_error)
 
-        return self._parse_response(response)
+            try:
+                # Reopened per attempt: a handle is exhausted after it is
+                # passed once to POST, so each retry must replay the same
+                # bytes through a fresh handle.
+                with path.open("rb") as handle:
+                    response = self._session.post(
+                        self._endpoint,
+                        headers={"X-API-Key-ID": api_key},
+                        data={"language_code": language_code, "format": output_format},
+                        files={"audio_file": (path.name, handle, content_type)},
+                        timeout=self._timeout,
+                    )
+            except requests.exceptions.Timeout as exc:
+                raise PrismaNetworkError(
+                    f"Gnani STT request timed out after {self._timeout}: {exc}"
+                ) from exc
+            except requests.exceptions.ConnectionError as exc:
+                # The request was never delivered, so nothing was billed.
+                last_error = PrismaNetworkError(f"Gnani STT request failed: {exc}")
+                continue
+            except requests.exceptions.RequestException as exc:
+                raise PrismaNetworkError(f"Gnani STT request failed: {exc}") from exc
+
+            try:
+                return self._parse_response(response)
+            except PrismaAPIError as exc:
+                if exc.status_code not in RETRYABLE_STATUS_CODES:
+                    raise
+                last_error = exc
+                continue
+
+        assert last_error is not None
+        raise last_error
+
+    def _sleep_before_retry(
+        self,
+        attempt: int,
+        last_error: PrismaError | None,
+    ) -> None:
+        """Bounded exponential backoff with jitter, honoring Retry-After."""
+        retry_after = getattr(last_error, "retry_after", None)
+        if isinstance(retry_after, (int, float)) and retry_after >= 0:
+            delay = min(float(retry_after), MAX_RETRY_AFTER_SECONDS)
+        else:
+            delay = min(
+                self._backoff_base_seconds * (2.0 ** (attempt - 1)),
+                MAX_BACKOFF_SECONDS,
+            )
+            delay += random.uniform(0, JITTER_MAX_SECONDS)
+        time.sleep(max(delay, 0.0))
 
     def _parse_response(self, response: requests.Response) -> TranscriptionResult:
+        retry_after = _parse_retry_after(response.headers)
         try:
             payload = response.json()
         except ValueError:
-            body = (response.text or "").strip().replace("\n", " ")[:200]
+            # Diagnostic head for operator logs only: the public message stays
+            # concise and never echoes provider/gateway body content.
+            body_head = (response.text or "").strip().replace("\n", " ")[:200]
             raise PrismaAPIError(
-                f"Gnani STT returned a non-JSON response "
-                f"(HTTP {response.status_code}): {body}",
+                f"Gnani STT returned a non-JSON response (HTTP {response.status_code}).",
                 status_code=response.status_code,
+                retry_after=retry_after,
+                body_head=body_head,
             ) from None
 
         if response.status_code != 200 or not isinstance(payload, dict):
             message, error_type = _extract_error(payload, response.status_code)
             raise PrismaAPIError(
-                message, status_code=response.status_code, error_type=error_type
+                message, status_code=response.status_code, error_type=error_type,
+                retry_after=retry_after,
             )
 
         if payload.get("success") is False:
             message, error_type = _extract_error(payload, response.status_code)
             raise PrismaAPIError(
-                message, status_code=response.status_code, error_type=error_type
+                message, status_code=response.status_code, error_type=error_type,
+                retry_after=retry_after,
             )
 
         transcript = payload.get("transcript")

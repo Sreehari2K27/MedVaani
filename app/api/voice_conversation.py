@@ -148,6 +148,15 @@ def _upstream_to_http_error(
             status_code=429,
             detail=hint or "Speech service rate limit exceeded. Wait a moment and retry.",
         )
+    # Retries were exhausted (or the failure is non-transient): the patient
+    # detail stays generic, while the operator log records the sanitized
+    # status/provider message (key-masked, truncated, no audio or transcripts).
+    logger.warning(
+        "Gnani STT failed after retries (HTTP %s, language=%s): %s",
+        status if status is not None else "unavailable",
+        language_code or "unspecified",
+        _safe_detail(" ".join(str(exc).split()))[:200],
+    )
     return HTTPException(status_code=502, detail=f"Gnani service failure: {exc}")
 
 

@@ -35,10 +35,14 @@ def make_response(
     payload: object | None = None,
     text: str = "",
     invalid_json: bool = False,
+    headers: dict | None = None,
 ) -> MagicMock:
     response = MagicMock(spec=requests.Response)
     response.status_code = status_code
     response.text = text
+    # ``headers`` is an instance attribute of requests.Response, so it is
+    # absent from the MagicMock(spec=...) surface: provide a default dict.
+    response.headers = dict(headers) if headers is not None else {}
     if invalid_json:
         response.json.side_effect = ValueError("not json")
     else:
@@ -250,6 +254,208 @@ def test_missing_transcript_field_raises_api_error(tmp_path: Path) -> None:
 
     with pytest.raises(PrismaAPIError):
         client.transcribe(audio)
+
+
+# ---- bounded retry behaviour (mirrors the Timbre TTS retry conventions) -----
+
+
+def make_retriable_response(
+    status_code: int, *, text: str = "", invalid_json: bool = False,
+    headers: dict | None = None,
+) -> MagicMock:
+    return make_response(
+        status_code=status_code, text=text, invalid_json=invalid_json,
+        headers=headers,
+    )
+
+
+@pytest.fixture
+def mocked_retry_timing(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """No real sleeping and no jitter randomness; records every slept delay."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(prisma.time, "sleep", lambda delay: sleeps.append(delay))
+    monkeypatch.setattr(prisma.random, "uniform", lambda low, high: 0)
+    return sleeps
+
+
+_OK_RESPONSE_PAYLOAD = {"success": True, "transcript": "I took Lantus yesterday."}
+
+
+def test_504_html_response_is_retried_then_successfully_transcribed(
+    tmp_path: Path, mocked_retry_timing: list[float]
+) -> None:
+    audio = make_audio(tmp_path)
+    retry_response = make_retriable_response(
+        504, text="<html>gateway timeout</html>", invalid_json=True
+    )
+    ok_response = make_response(payload=_OK_RESPONSE_PAYLOAD)
+    client, session = make_client()
+    session.post.side_effect = [retry_response, ok_response]
+
+    result = client.transcribe(audio, language_code="ml-IN")
+
+    assert result.text == "I took Lantus yesterday."
+    assert session.post.call_count == 2
+    assert mocked_retry_timing == [0.5]          # base delay after attempt 1
+
+
+def test_repeated_504_exhausts_retries_with_identical_requests(
+    tmp_path: Path, mocked_retry_timing: list[float]
+) -> None:
+    audio = make_audio(tmp_path)
+    retry_response = make_retriable_response(
+        504, text="<html>gateway timeout</html>", invalid_json=True
+    )
+    client, session = make_client()
+    session.post.side_effect = [retry_response, retry_response, retry_response]
+
+    with pytest.raises(PrismaAPIError) as excinfo:
+        client.transcribe(audio, language_code="ml-IN")
+
+    assert excinfo.value.status_code == 504
+    assert session.post.call_count == 3
+    first_kwargs = session.post.call_args_list[0].kwargs
+    second_kwargs = session.post.call_args_list[1].kwargs
+    third_kwargs = session.post.call_args_list[2].kwargs
+    for kwargs in (second_kwargs, third_kwargs):
+        assert kwargs["headers"] == first_kwargs["headers"]
+        assert kwargs["data"] == first_kwargs["data"]
+    assert mocked_retry_timing == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("status_code", [400, 403])
+def test_permanent_statuses_fail_immediately_without_retry(
+    tmp_path: Path, mocked_retry_timing: list[float], status_code: int
+) -> None:
+    audio = make_audio(tmp_path)
+    response = make_response(
+        status_code=status_code,
+        payload={
+            "success": False,
+            "error": {"type": "REJECTED", "message": "Bad audio."},
+        },
+    )
+    client, session = make_client(response=response)
+
+    with pytest.raises(PrismaAPIError) as excinfo:
+        client.transcribe(audio, language_code="ml-IN")
+
+    assert excinfo.value.status_code == status_code
+    assert session.post.call_count == 1
+    assert mocked_retry_timing == []
+
+
+def test_403_html_body_is_not_retried_and_public_message_stays_html_free(
+    tmp_path: Path, mocked_retry_timing: list[float]
+) -> None:
+    audio = make_audio(tmp_path)
+    response = make_retriable_response(
+        403, text="<html>access denied</html>", invalid_json=True
+    )
+    client, session = make_client()
+    session.post.side_effect = [response, response]
+
+    with pytest.raises(PrismaAPIError) as excinfo:
+        client.transcribe(audio, language_code="ml-IN")
+
+    assert excinfo.value.status_code == 403
+    assert session.post.call_count == 1
+    assert "<html>" not in str(excinfo.value)
+    assert excinfo.value.body_head == "<html>access denied</html>"
+    assert mocked_retry_timing == []
+
+
+def test_read_timeout_is_never_retried(
+    tmp_path: Path, mocked_retry_timing: list[float]
+) -> None:
+    audio = make_audio(tmp_path)
+    ok_response = make_response(payload=_OK_RESPONSE_PAYLOAD)
+    client, session = make_client()
+    session.post.side_effect = [
+        requests.exceptions.Timeout("too slow"),
+        ok_response,
+    ]
+
+    with pytest.raises(PrismaNetworkError):
+        client.transcribe(audio, language_code="ml-IN")
+
+    assert session.post.call_count == 1
+    assert mocked_retry_timing == []
+
+
+def test_connection_error_is_retried_then_successfully_transcribed(
+    tmp_path: Path, mocked_retry_timing: list[float]
+) -> None:
+    audio = make_audio(tmp_path)
+    ok_response = make_response(payload=_OK_RESPONSE_PAYLOAD)
+    client, session = make_client()
+    session.post.side_effect = [
+        requests.exceptions.ConnectionError("refused"),
+        ok_response,
+    ]
+
+    result = client.transcribe(audio, language_code="ml-IN")
+
+    assert result.text == "I took Lantus yesterday."
+    assert session.post.call_count == 2
+    assert len(mocked_retry_timing) == 1
+
+
+def test_retry_after_is_capped_and_backoff_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(prisma.time, "sleep", lambda delay: sleeps.append(delay))
+    monkeypatch.setattr(prisma.random, "uniform", lambda low, high: 0)
+    client, _ = make_client()
+
+    # A provider Retry-After of 999s is honored only up to MAX_RETRY_AFTER_SECONDS.
+    client._sleep_before_retry(1, PrismaAPIError("busy", status_code=429, retry_after=999.0))
+    assert sleeps == [prisma.MAX_RETRY_AFTER_SECONDS]
+    sleeps.clear()
+
+    # A Retry-After within the set is honored exactly.
+    client._sleep_before_retry(1, PrismaAPIError("busy", status_code=429, retry_after=17.5))
+    assert sleeps == [prisma.MAX_RETRY_AFTER_SECONDS]
+    sleeps.clear()
+
+    # Without a usable Retry-After, exponential backoff applies per attempt
+    # and is capped at MAX_BACKOFF_SECONDS.
+    client._sleep_before_retry(1, PrismaAPIError("busy", status_code=429))
+    client._sleep_before_retry(5, PrismaAPIError("busy", status_code=429))
+    assert sleeps == [0.5, prisma.MAX_BACKOFF_SECONDS]
+    sleeps.clear()
+
+    # Backoff doubles per attempt and never exceeds MAX_BACKOFF_SECONDS.
+    client._sleep_before_retry(1, None)
+    client._sleep_before_retry(2, None)
+    client._sleep_before_retry(99, None)
+    assert sleeps == [0.5, 1.0, prisma.MAX_BACKOFF_SECONDS]
+
+
+def test_non_json_504_message_has_no_body_and_retains_retry_after(
+    tmp_path: Path, mocked_retry_timing: list[float]
+) -> None:
+    audio = make_audio(tmp_path)
+    retry_response = make_retriable_response(
+        504,
+        text="<html>gateway timeout</html>",
+        invalid_json=True,
+        headers={"Retry-After": "0.2"},
+    )
+    ok_response = make_response(payload=_OK_RESPONSE_PAYLOAD)
+    client, session = make_client()
+    session.post.side_effect = [retry_response, ok_response]
+
+    result = client.transcribe(audio, language_code="ml-IN")
+
+    assert result.text == "I took Lantus yesterday."
+    assert mocked_retry_timing == [0.2]
+
+
+def test_zero_max_attempts_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        PrismaSTT(api_key="test-key", session=MagicMock(), max_attempts=0)
 
 
 def load_cli_module():
