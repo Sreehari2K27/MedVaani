@@ -152,6 +152,25 @@ def test_personalized_dosing_is_blocked_without_retrieval():
     assert provider.calls == 0
 
 
+def test_observed_fallback_questions_reach_the_grounded_answer_path():
+    """The three audited browser questions must not return the scope fallback:
+    they pass the guardrail, retrieve from the offline chunk index and reach
+    the (extractive-fallback) answer layer. The provider stub keeps this
+    fully offline."""
+    client = _client(mi_service=_grounded_service())
+    for question in (
+        "What is the active ingredient in Lantus SoloStar?",
+        "Can I reuse the needle on my Lantus SoloStar pen?",
+        "Can Lantus SoloStar cure diabetes permanently?",
+    ):
+        data = _post_chat(client, question).json()
+        assert data["status"] == "allowed", question
+        assert data["category"] == "product_info", question
+        assert data["urgent"] is False, question
+        assert data["retrieved_chunk_ids"], question  # retrieval ran
+        assert data["source_page_numbers"], question  # the passages are cited
+
+
 def test_urgent_symptoms_take_precedence_over_retrieval():
     stub = _MiServiceStub()
     client = _client(mi_service=stub)

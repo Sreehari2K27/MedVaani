@@ -3,7 +3,6 @@
 function Hero() {
   return (
     <section className="hero-section">
-      <div className="hero-aura" aria-hidden="true" />
       <div className="container hero-grid">
         <div style={styles.content}>
           <h1 style={styles.heading}>

@@ -210,6 +210,98 @@ body {
     linear-gradient(160deg, #f8f7ff 0%, #fbfaff 46%, #fffdfb 100%);
 }
 
+/* ---------- homepage shared page gradient ---------- */
+
+/* Per the reference look, ONE continuous background layer owns every
+   homepage color — the hero band and the sections below it — so nothing
+   clips or restarts at a section boundary (the previous seam was two
+   independent stacks meeting at the hero's clipped bottom edge). Hero-band
+   blobs are anchored in px from the page top so hero colors stay put
+   regardless of total page height; only the page-bottom white fade uses
+   percentage anchors. The palette matches the reference mesh:
+   lavender #DCD6FF, periwinkle #DCE4FF, pale blue #D8E5FA,
+   blush #F8D3E4, peach #FFD9BE, warm cream #FFF0D4. */
+.home-flow {
+  position: relative;
+  z-index: 0;
+}
+
+.home-flow::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    /* white wash bridging the white header into the hero */
+    linear-gradient(180deg, rgba(255, 255, 255, 0.65) 0px, rgba(255, 255, 255, 0) 70px),
+    /* readability shield: soft, behind the headline zone only */
+    radial-gradient(46% 240px at 30% 210px, rgba(255, 255, 255, 0.72) 0%, rgba(255, 255, 255, 0) 72%),
+    /* flowing lavender wave: one oversized annular (ring-shaped) gradient
+       whose visible upper arc forms a single broad, curved band. Its crest
+       starts just below the pen's halo (~y=400px on the right) and sweeps
+       down-left through the hero/card boundary into the space behind the
+       action cards, dissolving into white toward the lower centre and
+       blending into the peach wash on the right. The ring centre sits
+       off-canvas so no circle boundary is ever visible; pale translucent
+       stops keep it a soft pastel wave, not a stripe. */
+    /* flowing lavender wave: a circular ring gradient whose visible upper
+       arc is one broad, gently curved band. The circle (radius 1332px,
+       centre 1214px/1762px, i.e. behind and below the pen) crests at
+       (1214px, ~430px) — right under the pen's cream/peach halo — and
+       sweeps down-left through (~720px, ~525px) to (~216px, ~880px)
+       behind the action cards, then exits at the page's lower-left where
+       the bottom white fade dissolves it. Thin core (~106px), low max
+       alpha, off-canvas centre: no blob, stripe, panel or circle face. */
+    radial-gradient(
+      1332px 1332px at 1214px 1762px,
+      rgba(215, 207, 255, 0) 88%,
+      rgba(220, 228, 255, 0.3) 94%,
+      rgba(214, 205, 255, 0.48) 99%,
+      rgba(214, 205, 255, 0.5) 101%,
+      rgba(219, 214, 255, 0.32) 105%,
+      rgba(220, 228, 255, 0) 112%
+    ),
+    /* ---- hero band ---- */
+    /* lavender: dominant on the far left */
+    radial-gradient(70% 450px at 2% 170px, rgba(220, 214, 255, 0.85) 0%, rgba(220, 214, 255, 0) 72%),
+    /* periwinkle: upper-centre bridge */
+    radial-gradient(58% 380px at 38% 110px, rgba(220, 228, 255, 0.6) 0%, rgba(220, 228, 255, 0) 70%),
+    /* pale blue: centre, blending toward white */
+    radial-gradient(60% 400px at 55% 280px, rgba(216, 229, 250, 0.55) 0%, rgba(216, 229, 250, 0) 70%),
+    /* blush pink: upper-right */
+    radial-gradient(50% 300px at 96% 90px, rgba(248, 211, 228, 0.7) 0%, rgba(248, 211, 228, 0) 72%),
+    /* peach: around the pen */
+    radial-gradient(64% 380px at 84% 220px, rgba(255, 217, 190, 0.72) 0%, rgba(255, 217, 190, 0) 70%),
+    /* pale orange: lower-right of the pen */
+    radial-gradient(46% 280px at 92% 370px, rgba(255, 202, 160, 0.6) 0%, rgba(255, 202, 160, 0) 70%),
+    /* warm cream: highlight beneath the pen */
+    radial-gradient(52% 300px at 74% 440px, rgba(255, 240, 212, 0.7) 0%, rgba(255, 240, 212, 0) 68%),
+    /* lavender-blue: lower-centre of the hero band */
+    radial-gradient(52% 300px at 46% 500px, rgba(216, 219, 250, 0.5) 0%, rgba(216, 219, 250, 0) 70%),
+    /* lavender: lower-left of the hero band */
+    radial-gradient(56% 280px at 10% 520px, rgba(224, 216, 255, 0.55) 0%, rgba(224, 216, 255, 0) 70%),
+    /* ---- lower page: the wave + ambient wash keep flowing, unclipped;
+            the low lavender/periwinkle blobs that stacked into a purple
+            patch near the disclaimer were removed ---- */
+    radial-gradient(60% 380px at 2% 640px, rgba(220, 214, 255, 0.5) 0%, rgba(220, 214, 255, 0) 72%),
+    radial-gradient(54% 360px at 38% 640px, rgba(216, 229, 250, 0.42) 0%, rgba(216, 229, 250, 0) 70%),
+    radial-gradient(40% 300px at 82% 560px, rgba(255, 222, 196, 0.35) 0%, rgba(255, 222, 196, 0) 70%),
+    radial-gradient(46% 320px at 94% 620px, rgba(255, 217, 190, 0.42) 0%, rgba(255, 217, 190, 0) 70%),
+    radial-gradient(50% 360px at 88% 820px, rgba(255, 240, 212, 0.45) 0%, rgba(255, 240, 212, 0) 70%),
+    /* bottom-of-page fade to white (percentage-anchored to the true end) */
+    linear-gradient(180deg, rgba(255, 255, 255, 0) calc(100% - 320px), rgba(255, 255, 255, 0.85) calc(100% - 40px), #ffffff 100%),
+    /* near-white base keeps the whole wash light and cohesive */
+    linear-gradient(180deg, #fbfaff 0px, #fdfcff 600px, #ffffff 100%);
+}
+
+/* Page content lifts above the shared gradient layer; sections keep their
+   normal layout and only gain a stacking position. */
+.home-flow > section {
+  position: relative;
+  z-index: 1;
+}
+
 .hero-grid {
   position: relative;
   z-index: 1;

@@ -1,9 +1,12 @@
+/* Card tints echo the hero mesh palette, kept pastel but clearly
+   distinguishable: cool blue/lavender drifting into blush on the information
+   card, warm peach softening into cream on the reporting card. */
 .action-card.lavender {
-  background: linear-gradient(135deg, #f1f0ff 0%, #f8f8ff 100%);
+  background: linear-gradient(135deg, #e4e7ff 0%, #efeaff 52%, #fdf3f7 100%);
 }
 
 .action-card.peach {
-  background: linear-gradient(135deg, #fff3ee 0%, #fffaf8 100%);
+  background: linear-gradient(135deg, #ffe4d2 0%, #fff0e4 55%, #fffcf4 100%);
 }
 
 .action-card .icon-lavender {

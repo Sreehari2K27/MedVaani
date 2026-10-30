@@ -32,14 +32,14 @@ interface ChatMessage {
   suggestAe?: boolean;
 }
 
-function MicIcon({ active }: { active: boolean }) {
+function MicIcon() {
   return (
     <svg
       width="20"
       height="20"
       viewBox="0 0 24 24"
       fill="none"
-      stroke={active ? "#b91c1c" : "#475569"}
+      stroke="currentColor"
       strokeWidth="2"
       strokeLinecap="round"
       strokeLinejoin="round"
@@ -48,6 +48,25 @@ function MicIcon({ active }: { active: boolean }) {
       <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"></path>
       <path d="M19 10v1a7 7 0 0 1-14 0v-1"></path>
       <line x1="12" y1="19" x2="12" y2="22"></line>
+    </svg>
+  );
+}
+
+function SendIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m22 2-7 20-4-9-9-4z"></path>
+      <path d="M22 2 11 13"></path>
     </svg>
   );
 }
@@ -289,42 +308,53 @@ function MiPage() {
       ) : null}
 
       <div className="mi-composer">
-        <textarea
-          className="mi-input"
-          rows={2}
-          value={draft}
-          placeholder="Ask about Lantus SoloStar… (Enter to send, Shift+Enter for a new line)"
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={handleComposerKeyDown}
-          disabled={micBusy}
-          aria-label="Your question"
-        />
-        <div className="mi-composer-actions">
-          <button
-            type="button"
-            className={`mi-mic${recorder.recording ? " mi-mic--active" : ""}`}
-            onClick={toggleRecording}
-            disabled={micBusy && !recorder.recording}
-            aria-pressed={recorder.recording}
-            aria-label={recorder.recording ? "Stop recording" : "Speak your question"}
-          >
-            <MicIcon active={recorder.recording} />
-            <span>
-              {recorder.recording
-                ? "Listening… tap to stop"
-                : transcribing
-                  ? "Transcribing…"
-                  : "Speak"}
+        <div className="mi-composer-row">
+          <textarea
+            className="mi-input"
+            rows={2}
+            value={draft}
+            placeholder="Ask about Lantus SoloStar… (Enter to send, Shift+Enter for a new line)"
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={handleComposerKeyDown}
+            disabled={micBusy}
+            aria-label="Your question"
+          />
+          <div className="mi-composer-actions">
+            <button
+              type="button"
+              className={`mi-mic-btn${
+                recorder.recording ? " mi-mic-btn--recording" : ""
+              }`}
+              onClick={toggleRecording}
+              disabled={micBusy && !recorder.recording}
+              aria-pressed={recorder.recording}
+              aria-label={recorder.recording ? "Stop recording" : "Speak your question"}
+              title={recorder.recording ? "Tap to stop recording" : "Speak your question"}
+            >
+              <MicIcon />
+            </button>
+            <button
+              type="button"
+              className="mi-send-btn"
+              onClick={submitDraft}
+              disabled={!canSubmit(draft, micBusy)}
+              aria-label="Send message"
+              title="Send message"
+            >
+              <SendIcon />
+            </button>
+          </div>
+        </div>
+        <div className="mi-composer-hint">
+          {recorder.recording ? (
+            <span className="mi-composer-hint--recording">
+              Listening… tap to stop
             </span>
-          </button>
-          <button
-            type="button"
-            className="mi-send"
-            onClick={submitDraft}
-            disabled={!canSubmit(draft, micBusy)}
-          >
-            Send
-          </button>
+          ) : transcribing ? (
+            <span>Transcribing…</span>
+          ) : (
+            <span>Type your question, or tap the mic to speak.</span>
+          )}
         </div>
       </div>
 

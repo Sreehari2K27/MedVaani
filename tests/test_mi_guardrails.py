@@ -65,6 +65,80 @@ def test_manufacturer_instruction_questions_allowed():
         assert result.rule is MIRule.ALLOWED_PRODUCT_INFO
 
 
+def test_observed_fallback_questions_allowed():
+    """The three audited browser questions that used to fall back as out of
+    scope must reach the grounded retrieval answer path."""
+    for question in (
+        "What is the active ingredient in Lantus SoloStar?",
+        "Can I reuse the needle on my Lantus SoloStar pen?",
+        "Can Lantus SoloStar cure diabetes permanently?",
+    ):
+        result = MIGuardrail.check(question)
+        assert result.allowed is True, question
+        assert result.rule is MIRule.ALLOWED_PRODUCT_INFO, question
+        assert result.category == "product_info", question
+        assert result.requires_retrieval is True, question
+        assert result.response_text == ""  # no fallback string
+
+
+def test_hybrid_service_does_not_fall_back_on_observed_questions():
+    """End-to-end through the guardrail service: the audited questions are
+    routed to the answer service instead of returning the scope fallback."""
+    service = MIGHybridService()
+    for question in (
+        "What is the active ingredient in Lantus SoloStar?",
+        "Can I reuse the needle on my Lantus SoloStar pen?",
+        "Can Lantus SoloStar cure diabetes permanently?",
+    ):
+        result = service.handle(question)
+        assert result.status == "allowed", question
+        assert result.allowed is True, question
+        assert "I can only answer general product information" not in result.answer
+
+
+def test_new_terms_stay_question_shaped():
+    """Statements (not questions) mentioning the new terms stay out of scope:
+    no unrestricted keyword allow was added."""
+    for statement in (
+        "My doctor told me reuse of the needle is bad",
+        "I want a cure for this",
+        "The composition is printed on the leaflet",
+    ):
+        result = MIGuardrail.check(statement)
+        assert result.allowed is False, statement
+        assert result.rule is MIRule.OUT_OF_SCOPE, statement
+
+
+def test_mixed_wording_with_new_stay_blocked_by_safety_checks():
+    """Personalized intents phrased with the new terminology are still caught
+    by the SAFETY checks that run before the product-info allow."""
+    blocked_cases = (
+        (
+            "Should I stop taking Lantus and find a cure instead?",
+            MIRule.BLOCKED_MEDICATION_CHANGE,
+        ),
+        (
+            "What treatment should I take for a permanent cure?",
+            MIRule.BLOCKED_PERSONALIZED_TREATMENT,
+        ),
+        (
+            "How many units should I take to reuse my pen safely?",
+            MIRule.BLOCKED_PERSONALIZED_DOSING,
+        ),
+        (
+            # Pre-existing precedence: the "what should I do … sugar" idiom is
+            # classified as personalized dosing before the treatment-rule
+            # class is ever consulted.
+            "What should I do to cure my high sugar for me?",
+            MIRule.BLOCKED_PERSONALIZED_DOSING,
+        ),
+    )
+    for question, expected_rule in blocked_cases:
+        result = MIGuardrail.check(question)
+        assert result.allowed is False, question
+        assert result.rule is expected_rule, question
+
+
 def test_unsafe_intents_still_block_before_product_info_rule():
     """The new product-info clauses never override the earlier safety checks:
     personalized dosing, medication change and personalized treatment are

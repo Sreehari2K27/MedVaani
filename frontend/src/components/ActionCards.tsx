@@ -84,8 +84,6 @@ function ActionCards({ onReportSideEffect, onGetProductInfo }: ActionCardsProps)
 const styles: Record<string, React.CSSProperties> = {
   section: {
     padding: "3rem 0 2.25rem",
-    background:
-      "radial-gradient(55% 95% at 100% 0%, rgba(224, 214, 255, 0.55) 0%, rgba(224, 214, 255, 0) 65%), linear-gradient(180deg, #ffffff 0%, #fbfaff 100%)",
   },
   card: { display: "flex", alignItems: "center", gap: "1.75rem", padding: "2.5rem", borderRadius: "1.5rem", cursor: "pointer", transition: "transform 0.2s ease, box-shadow 0.2s ease" },
   iconWrapper: { display: "flex", alignItems: "center", justifyContent: "center", width: "6rem", height: "6rem", borderRadius: "1.5rem", flexShrink: 0 },

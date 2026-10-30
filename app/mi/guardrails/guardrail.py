@@ -56,6 +56,21 @@ _PRODUCT_INFO_PATTERNS = re.compile(
     # are still blocked before this rule is ever consulted.
     r"|how\s+(?:to\s+use|do\s+i\b[^.?!]{0,80}"
     r"(?:use|pen\b|needle|attach|injec\w*|safety\s+test|prim\w*|cap|dispose|discard|remove)))"
+    # General composition questions ("What is the active ingredient in
+    # Lantus SoloStar?"). Question-shaped span only: the question word must
+    # precede the ingredient/composition wording within one sentence, so a
+    # statement mentioning "ingredients" outside a question stays out of
+    # scope and the bare keyword is never an automatic allow.
+    r"|what\b[^.?!]{0,40}\b(?:active\s+)?ingredients?\b|composition\s+of\b"
+    r"|which\b[^.?!]{0,40}\b(?:active\s+)?ingredients?\b"
+    # General efficacy questions ("Can Lantus SoloStar cure diabetes
+    # permanently?"). Same question-span rule; no bare "cure" allow.
+    r"|can\b[^.?!]{0,40}\bcured?\b|does\b[^.?!]{0,40}\bcured?\b"
+    # Device/leaflet reuse questions ("Can I reuse the needle on my pen?",
+    # "How many times can I reuse the needle?"). Same question-span rule -
+    # the leaflet's needle instructions (the grounding passages) cover it;
+    # "reuse" outside a question span is not product info.
+    r"|can\b[^.?!]{0,40}\bre-?us"
 )
 
 

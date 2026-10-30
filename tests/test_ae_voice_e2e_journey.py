@@ -247,7 +247,7 @@ def test_self_reporter_consent_yes_completes_the_full_journey():
     # Confirmation wording appeared exactly once per confirmed value.
     spoken = "\n".join(body["response_text"] for body in bodies)
     assert spoken.count("I have your details as Alpha Jones, 05-Jan-1990.") == 1
-    assert spoken.count("I have the number ending in 4321.") == 1
+    assert spoken.count("I have a 10-digit number ending in 4321.") == 1
     assert spoken.count("I heard your email address as alpha@example.com.") == 1
     # The patient contact number is never asked again after it is confirmed.
     assert spoken.count("best contact number for you") == 1
@@ -309,12 +309,12 @@ def test_reporter_branch_with_declined_consent_and_urgent_severity():
     # Branch-specific confirmation wording appeared exactly once each.
     spoken = "\n".join(body["response_text"] for body in bodies)
     assert spoken.count("I have your name as Dr. Observer.") == 1
-    assert spoken.count("I have the number ending in 0001.") == 1
+    assert spoken.count("I have a 10-digit number ending in 0001.") == 1
     assert spoken.count(
         "Let me read that back to make sure I've recorded it correctly: "
         "Mary Jones, 12-Mar-1975."
     ) == 1
-    assert spoken.count("I have the number ending in 4399.") == 1
+    assert spoken.count("I have a 10-digit number ending in 4399.") == 1
     # Consent was asked once; the patient contact number was asked once.
     assert spoken.count("Would it be okay for the appropriate team") == 1
     assert spoken.count("patient's contact number") == 1

@@ -50,14 +50,14 @@ function App() {
       break;
     default:
       content = (
-        <>
+        <div className="home-flow">
           <Hero />
           <ActionCards
             onReportSideEffect={openAe}
             onGetProductInfo={() => navigate("mi")}
           />
           <DisclaimerCard />
-        </>
+        </div>
       );
   }
 

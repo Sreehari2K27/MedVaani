@@ -26,8 +26,8 @@
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  section: { padding: "2rem 0 4.5rem", background: "linear-gradient(180deg, #fbfaff 0%, #ffffff 100%)" },
-  card: { display: "flex", alignItems: "flex-start", gap: "1.5rem", padding: "2.25rem", background: "#f1f0ff", borderRadius: "1.5rem", border: "none" },
+  section: { padding: "2rem 0 4.5rem" },
+  card: { display: "flex", alignItems: "flex-start", gap: "1.5rem", padding: "2.25rem", background: "linear-gradient(135deg, #f3f2ff 0%, #faf9ff 100%)", borderRadius: "1.5rem", border: "none" },
   iconWrapper: { display: "flex", alignItems: "center", justifyContent: "center", width: "3.5rem", height: "3.5rem", borderRadius: "1.125rem", background: "rgba(99, 102, 241, 0.12)", flexShrink: 0, marginTop: "0.125rem" },
   content: { flex: 1 },
   title: { fontSize: "1.25rem", fontWeight: 700, marginBottom: "0.6rem", color: "#0f1b2b" },
