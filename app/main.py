@@ -112,6 +112,21 @@ def create_app(
     output_dir.mkdir(exist_ok=True)
     application.mount("/audio", StaticFiles(directory=output_dir), name="audio")
 
+    # Deployment health probe: registered BEFORE the SPA catch-all mount so
+    # platform checks never fall through to the static index.html.
+    @application.get("/health")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    # Serve the built React frontend (frontend/dist) last, so every API route
+    # and the /audio mount above keep precedence over the SPA catch-all. The
+    # guard keeps local development working when the frontend was not built.
+    frontend_dist = Path(__file__).resolve().parents[1] / "frontend" / "dist"
+    if frontend_dist.is_dir():
+        application.mount(
+            "/", StaticFiles(directory=frontend_dist, html=True), name="frontend"
+        )
+
     return application
 
 

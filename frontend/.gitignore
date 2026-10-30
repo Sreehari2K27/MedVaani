@@ -8,9 +8,13 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
-dist
 dist-ssr
 *.local
+
+# The built SPA ships in Git for the single-service deployment; this deeper
+# re-inclusion overrides the root .gitignore's generic `dist/` rule for
+# frontend/dist only, leaving Python build-artifact ignores untouched.
+!dist/
 
 # Editor directories and files
 .vscode/*
