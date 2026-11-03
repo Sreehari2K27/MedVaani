@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import json
+import logging
+import math
 import re
 
 try:
@@ -14,6 +16,8 @@ try:
 except ImportError:
     TfidfVectorizer = None
     cosine_similarity = None
+
+logger = logging.getLogger(__name__)
 
 
 # Light token normalization: strips common English suffixes so "stored" vs
@@ -128,22 +132,44 @@ class LantusRetriever:
 
     def _load_chunks(self) -> List[Dict[str, Any]]:
         if not self.chunks_path.exists():
+            logger.warning(
+                "mi_retriever chunk file not found at %s; retrieval has no "
+                "evidence to answer from (operators: verify the chunks file "
+                "is deployed)",
+                self.chunks_path,
+            )
             return []
         with open(self.chunks_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
     def _build_index(self) -> None:
         if TfidfVectorizer is None or cosine_similarity is None:
-            return  # fallback mode
+            logger.warning(
+                "mi_retriever degraded: scikit-learn unavailable, falling back "
+                "to keyword-overlap retrieval (operators: verify scikit-learn "
+                "is installed in the deployment environment)"
+            )
+            self._build_chunk_terms()
+            return
         texts = [c["text"] for c in self.chunks]
         if not texts:
+            logger.warning(
+                "mi_retriever degraded: no reference chunks loaded at %s; "
+                "retrieval cannot answer product questions",
+                self.chunks_path,
+            )
             return
         self.vectorizer = TfidfVectorizer(analyzer=tokenize_text, max_features=2000)
         self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+        self._build_chunk_terms()
         self._idf = dict(
             zip(self.vectorizer.get_feature_names_out(), self.vectorizer.idf_)
         )
-        # Per-chunk term sets (body text + section heading) for rerank coverage.
+
+    def _build_chunk_terms(self) -> None:
+        # Per-chunk term sets (body text + section heading): the rerank
+        # coverage in TF-IDF mode and the keyword-overlap scoring in
+        # degraded mode share this same normalized token representation.
         self._chunk_terms = [
             set(tokenize_text(c["text"]))
             | set(tokenize_text(c.get("section_heading") or ""))
@@ -164,26 +190,61 @@ class LantusRetriever:
         k = max(1, k) if k else 3
 
         if self.vectorizer is None or self.tfidf_matrix is None:
-            # Simple keyword fallback
-            results = []
-            query_lower = query.lower()
-            for c in self.chunks:
-                text_lower = c["text"].lower()
-                score = text_lower.count(query_lower) / max(1, len(text_lower))
-                if query_lower in text_lower:
-                    results.append((score, c))
-            results.sort(key=lambda x: x[0], reverse=True)
-            top = results[:k]
-            return [
-                RetrievedChunk(
-                    chunk_id=c["chunk_id"],
-                    page_number=c["page_number"],
-                    section_heading=c.get("section_heading"),
-                    relevance_score=float(s),
-                    text=c["text"],
+            # Degraded keyword-overlap retrieval (scikit-learn unavailable).
+            # Deterministic scoring over the SAME normalized tokens the TF-IDF
+            # analyzer uses, with IDF weights computed straight from the
+            # reference chunks themselves (pure Python; no sklearn needed):
+            # a term that appears in every chunk (e.g. the product name) gets
+            # no weight, mirroring how the TF-IDF subject-coverage rerank
+            # discounts boilerplate. Rank by distinct matched-term weight,
+            # then by matched-token density (occurrences per chunk character)
+            # so long chunks cannot swamp subject relevance. Never invents
+            # relevance an overlap cannot support.
+            query_terms = set(tokenize_text(expand_query(query)))
+            if not query_terms:
+                return []
+            n_docs = len(self._chunk_terms)
+            doc_freq = {
+                term: sum(1 for terms in self._chunk_terms if term in terms)
+                for term in query_terms
+            }
+            term_weight = {
+                term: math.log((n_docs + 1.0) / (doc_freq[term] + 1.0))
+                for term in query_terms
+            }
+            scored = []
+            for index in range(len(self.chunks)):
+                matched = query_terms & self._chunk_terms[index]
+                if not matched:
+                    continue
+                c = self.chunks[index]
+                text_lower = (
+                    f"{c['text']}\n{c.get('section_heading') or ''}".lower()
                 )
-                for s, c in top
-            ]
+                occurrences = sum(text_lower.count(term) for term in matched)
+                weight = sum(term_weight[term] for term in matched)
+                density = occurrences / max(1, len(c["text"]))
+                scored.append((weight, density, index))
+            scored.sort(key=lambda entry: (-entry[0], -entry[1]))
+            results = []
+            for weight, _density, index in scored[:k]:
+                c = self.chunks[index]
+                results.append(
+                    RetrievedChunk(
+                        chunk_id=c["chunk_id"],
+                        page_number=c["page_number"],
+                        section_heading=c.get("section_heading"),
+                        relevance_score=round(weight, 6),
+                        text=c["text"],
+                    )
+                )
+            if results:
+                logger.warning(
+                    "mi_retriever degraded retrieval in use: matched %d "
+                    "chunk(s) by idf-weighted keyword overlap",
+                    len(results),
+                )
+            return results
 
         # TF-IDF similarity, then a subject-coverage rerank of the top pool
         # (see _RERANK_* above). `relevance_score` stays the cosine value.
